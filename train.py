@@ -1,167 +1,234 @@
 """
-ftmo_agent/train.py — Training script for the FTMO trading agent.
-Trains PPO with LSTM on XAUUSD M15 data with FTMO rules.
+ftmo_agent/train_v4.py — Training V4 with all fixes:
+- Curriculum learning (3 phases)
+- Pure PnL reward
+- Variable spread, slippage, commission
+- V4 features with correlations
+- Same DreamerV3 architecture
 """
-import sys
-import os
+import sys, os, json, time
 import numpy as np
 import pandas as pd
 import torch
-import random
-import json
 from datetime import datetime
+from collections import deque
 
-# Add parent to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'octopus'))
 
-from features import compute_features
-from environment import FTMOTradingEnv, BUY, SELL, HOLD, CLOSE
-from agent import PPOTrainer
+from config import SYMBOLS, ACTIVE_SYMBOLS, FTMO_CONFIG, N_ACTIONS
+from features_v2 import compute_multi_tf_features, compute_correlations
+from environment import MultiSymbolEnvV4
+from dreamer_trainer_v2 import DreamerV3AgentV2, ReplayBuffer
 
-def load_data():
-    """Load XAUUSD M15 data."""
-    data_path = os.path.join(os.path.dirname(__file__), 'data', 'xauusd_m15.csv')
-    df = pd.read_csv(data_path)
-    df['time'] = pd.to_datetime(df['time'])
-    df = df.sort_values('time').reset_index(drop=True)
-    
-    # Compute features
-    df, feature_cols = compute_features(df, lookback=48)
-    
-    # Split: train (80%), val (20%)
-    n = len(df)
-    train_end = int(n * 0.8)
-    train_df = df.iloc[:train_end].reset_index(drop=True)
-    val_df = df.iloc[train_end:].reset_index(drop=True)
-    
-    print(f"Data loaded: {len(df)} bars")
-    print(f"Train: {len(train_df)} ({train_df['time'].iloc[0]} → {train_df['time'].iloc[-1]})")
-    print(f"Val: {len(val_df)} ({val_df['time'].iloc[0]} → {val_df['time'].iloc[-1]})")
-    print(f"Features: {len(feature_cols)}")
-    
-    return train_df, val_df, feature_cols
 
-def train_agent(n_episodes=500, save_dir='checkpoints'):
-    """Train the PPO agent."""
-    os.makedirs(save_dir, exist_ok=True)
-    
-    train_df, val_df, feature_cols = load_data()
-    
-    # Create environments
-    env = FTMOTradingEnv(train_df, feature_cols, lookback=48)
-    val_env = FTMOTradingEnv(val_df, feature_cols, lookback=48)
-    
-    # Create agent
-    n_features = len(feature_cols) + 3  # + position info
-    trainer = PPOTrainer(n_features=n_features, n_actions=4, 
-                         lr=3e-4, batch_size=128, n_epochs=10,
-                         device='cuda')
-    
-    print(f"Device: {trainer.device}")
-    print(f"Model params: {sum(p.numel() for p in trainer.model.parameters()):,}")
-    
-    best_val_profit = -float('inf')
-    metrics_log = []
-    
-    for episode in range(n_episodes):
-        # === TRAINING ===
-        obs = env.reset()
-        done = False
-        ep_reward = 0
-        ep_steps = 0
-        max_steps = min(2000, len(train_df) - env.lookback - 1)
-        
-        # Random start for diverse experience
-        if episode > 10:
-            start = np.random.randint(env.lookback, len(train_df) - max_steps - 1)
-            env.current_step = start
-        
-        while not done and ep_steps < max_steps:
-            obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(trainer.device)
-            action, log_prob, value, entropy = trainer.model.get_action(obs_tensor)
-            
-            next_obs, reward, done, info = env.step(action)
-            trainer.collect(obs, action, reward, log_prob, value, done, info)
-            
-            obs = next_obs
-            ep_reward += reward
-            ep_steps += 1
-            
-            # Update every 256 steps
-            if len(trainer.rollout) >= 256:
-                trainer.update(last_value=value if not done else 0)
-        
-        # Final update
-        if len(trainer.rollout) >= 32:
-            trainer.update(last_value=0)
-        
-        # === VALIDATION (every 10 episodes) ===
-        if episode % 10 == 0 or episode == n_episodes - 1:
-            val_profit, val_trades, val_winrate, val_dd = validate(trainer, val_env)
-            
-            metrics = {
-                'episode': episode,
-                'train_reward': ep_reward,
-                'train_steps': ep_steps,
-                'train_trades': env.total_trades,
-                'train_profit_pct': (env.balance - env.account_size) / env.account_size,
-                'train_winrate': env.win_rate,
-                'val_profit_pct': val_profit,
-                'val_trades': val_trades,
-                'val_winrate': val_winrate,
-                'val_max_dd': val_dd,
-                'timestamp': datetime.now().isoformat(),
-            }
-            metrics_log.append(metrics)
-            
-            print(f"Ep {episode:4d} | reward={ep_reward:7.2f} | "
-                  f"train_pnl={metrics['train_profit_pct']:+.2%} | "
-                  f"val_pnl={val_profit:+.2%} | val_trades={val_trades} | "
-                  f"val_wr={val_winrate:.1%} | val_dd={val_dd:.2%}")
-            
-            # Save best model
-            if val_profit > best_val_profit:
-                best_val_profit = val_profit
-                trainer.save(os.path.join(save_dir, 'best_model.pt'))
-                print(f"  🏆 New best! val_pnl={val_profit:+.2%}")
-            
-            # Save periodic checkpoint
-            if episode % 50 == 0:
-                trainer.save(os.path.join(save_dir, f'checkpoint_ep{episode}.pt'))
-    
-    # Save final model
-    trainer.save(os.path.join(save_dir, 'final_model.pt'))
-    
-    # Save metrics
-    with open(os.path.join(save_dir, 'metrics.json'), 'w') as f:
-        json.dump(metrics_log, f, indent=2)
-    
-    print(f"\nTraining complete. Best val PnL: {best_val_profit:+.2%}")
-    print(f"Models saved in {save_dir}/")
+def load_all_symbols():
+    """Load data for all symbols and compute V4 features."""
+    data_dict = {}
+    data_dir = os.path.join(os.path.dirname(__file__), 'data')
+    for symbol in ACTIVE_SYMBOLS:
+        path = os.path.join(data_dir, f'{symbol}_m15.csv')
+        if not os.path.exists(path):
+            print(f"  ⚠️ {symbol}: pas de fichier {path}")
+            continue
+        df = pd.read_csv(path)
+        df['time'] = pd.to_datetime(df['time'])
+        df = df.sort_values('time').reset_index(drop=True)
+        features, feat_names, df_processed = compute_multi_tf_features(df, lookback=48, symbol=symbol)
+        data_dict[symbol] = (features, feat_names, df_processed)
+        print(f"  ✅ {symbol}: {len(df)} bars → {features.shape[1]} features")
+    return data_dict
 
-def validate(trainer, env):
-    """Run validation episode."""
-    obs = env.reset()
-    done = False
-    max_steps = len(env.df) - env.lookback - 1
-    
-    max_dd = 0
-    peak = env.account_size
-    
-    while not done and env.current_step < max_steps:
-        obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(trainer.device)
-        action, _, _, _ = trainer.model.get_action(obs_tensor, deterministic=True)
-        obs, reward, done, info = env.step(action)
-        
-        if env.balance > peak:
-            peak = env.balance
-        dd = (peak - env.balance) / env.account_size
-        if dd > max_dd:
-            max_dd = dd
-    
-    profit_pct = (env.balance - env.account_size) / env.account_size
-    return profit_pct, env.total_trades, env.win_rate, max_dd
 
-if __name__ == '__main__':
-    n_ep = int(sys.argv[1]) if len(sys.argv) > 1 else 500
-    train_agent(n_episodes=n_ep)
+class V4Trainer:
+    """Trainer V4 with curriculum learning."""
+
+    def __init__(self, n_episodes=3000, save_dir='checkpoints_v4'):
+        self.n_episodes = n_episodes
+        self.save_dir = save_dir
+        os.makedirs(save_dir, exist_ok=True)
+
+        print("📦 Chargement des données V4...")
+        data_dict = load_all_symbols()
+        print(f"   {len(data_dict)} symboles chargés")
+
+        # Compute correlations
+        print("🔗 Calcul des corrélations inter-symboles...")
+        self.correlations = compute_correlations(data_dict)
+        print(f"   {len(self.correlations)} symboles corrélés")
+
+        # Create temporary env to get feature dimensions
+        temp_env = MultiSymbolEnvV4(data_dict, lookback=48, curriculum_episode=0)
+        n_features = temp_env.n_features
+        print(f"🧠 Dimensions d'entrée: {n_features} features")
+
+        self.agent = DreamerV3AgentV2(
+            input_dim=n_features, seq_len=48, embedding_dim=128,
+            stoch_size=32, stoch_classes=32, deter_size=512,
+            hidden_dim=512, action_dim=N_ACTIONS,
+            horizon=30, gamma=0.997, lambda_=0.95,
+        )
+
+        self.data_dict = data_dict
+        self.replay = ReplayBuffer(capacity=500000)
+        self.best_val_pnl = -999
+        self.log_path = os.path.join(save_dir, 'training_v4.log')
+        self.metrics_path = os.path.join(save_dir, 'metrics.json')
+        self.metrics = []
+
+    def run(self):
+        log_file = open(self.log_path, 'w')
+        print("\n=== PHASE 1: Random collection ===")
+        self._collect_random(3500)
+
+        print(f"\n=== PHASE 2: Ultra training V4 ({self.n_episodes} episodes) ===")
+
+        for ep in range(self.n_episodes):
+            t0 = time.time()
+
+            # Create env with curriculum phase based on episode
+            env = MultiSymbolEnvV4(self.data_dict, lookback=48, curriculum_episode=ep)
+            obs = env.reset()
+
+            ep_reward = 0
+            ep_steps = 0
+            while True:
+                mask = env.get_action_mask()
+                action, log_prob, value = self.agent.get_action(obs, action_mask=mask, temperature=1.0)
+                next_obs, reward, done, info = env.step(action)
+
+                # Store in replay
+                self.replay.add(obs, action, reward, done, next_obs, mask)
+                ep_reward += reward
+                ep_steps += 1
+                obs = next_obs
+                if done or ep_steps > 2000:
+                    break
+
+            # Training step every episode
+            wm_loss, jepa_loss, ac_loss, entropy = 0, 0, 0, 0
+            if len(self.replay) > 1000:
+                # World model + JEPA training
+                wm_loss, jepa_loss = 0, 0
+                for _ in range(2):
+                    batch = self.replay.sample(512)
+                    wml, jl = self.agent.train_wm(batch)
+                    wm_loss += wml
+                    jepa_loss += jl
+
+                # Actor-Critic training
+                ac_loss = 0
+                ent = 0
+                for _ in range(1):
+                    batch = self.replay.sample(256)
+                    acl, e = self.agent.train_ac(batch)
+                    ac_loss += acl
+                    ent = e
+
+            # Temperature management
+            self.agent.temperature = max(0.7, self.agent.temperature * 0.9995)
+            if ep % 500 == 0 and ep > 0:
+                self.agent.temperature = min(2.0, self.agent.temperature + 0.5)
+                print(f"   🔄 Cyclic temperature restart → {self.agent.temperature:.2f}")
+
+            # Validation
+            val_pnl = 0
+            val_trades = 0
+            if ep % 25 == 0:
+                val_pnl, val_trades, val_wr, val_dd, val_bs = self._validate()
+
+            # Logging
+            t = time.time() - t0
+            phase = env._get_curriculum_phase()[0]
+            log = (f"Ep {ep:>4d} | {t:.2f}s | replay={len(self.replay)} "
+                   f"T={self.agent.temperature:.1f} | phase={phase} "
+                   f"wm={wm_loss:.4f} jepa={jepa_loss:.2f} ac={ac_loss:.4f} ent={ent:.3f} "
+                   f"| val={val_pnl:+.2f}% trades={val_trades} wr={val_wr:.0f}% dd={val_dd:.2f}% B/S={val_bs}")
+
+            print(log)
+            log_file.write(log + '\n')
+            log_file.flush()
+
+            # Save metrics
+            self.metrics.append({
+                'episode': ep, 'reward': ep_reward, 'steps': ep_steps,
+                'val_pnl': val_pnl, 'val_trades': val_trades,
+                'wm_loss': wm_loss, 'jepa_loss': jepa_loss,
+                'ac_loss': ac_loss, 'entropy': entropy,
+                'phase': phase, 'temperature': self.agent.temperature,
+            })
+            with open(self.metrics_path, 'w') as f:
+                json.dump(self.metrics, f, indent=2)
+
+            # Save checkpoints
+            if ep % 200 == 0:
+                path = os.path.join(self.save_dir, f'ckpt_ep{ep}.pt')
+                self.agent.save(path)
+                print(f"   💾 Saved: {path}")
+
+            if val_pnl > self.best_val_pnl:
+                self.best_val_pnl = val_pnl
+                path = os.path.join(self.save_dir, 'best_model.pt')
+                self.agent.save(path)
+                print(f"   🏆 NEW BEST: val_pnl={val_pnl:+.2f}%")
+
+        # Final save
+        path = os.path.join(self.save_dir, 'final_model.pt')
+        self.agent.save(path)
+        print(f"\n✅ Done! Best val PnL: {self.best_val_pnl:+.2f}%")
+        log_file.close()
+
+    def _collect_random(self, n_steps):
+        """Phase 1: random exploration."""
+        env = MultiSymbolEnvV4(self.data_dict, lookback=48, curriculum_episode=0)
+        collected = 0
+        while collected < n_steps:
+            obs = env.reset()
+            for _ in range(200):
+                mask = env.get_action_mask()
+                action = np.random.choice(np.where(mask)[0])
+                next_obs, reward, done, info = env.step(action)
+                self.replay.add(obs, action, reward, done, next_obs, mask)
+                collected += 1
+                obs = next_obs
+                if done:
+                    break
+        print(f"   Collected {collected} transitions (replay: {len(self.replay)})")
+
+    def _validate(self):
+        """Run validation episode on XAUUSD at current step."""
+        symbol = 'XAUUSD'
+        if symbol not in self.data_dict:
+            return 0, 0, 0, 0, '0/0'
+
+        env = MultiSymbolEnvV4(self.data_dict, lookback=48, curriculum_episode=9999)
+        env.current_symbol = symbol
+        env.features, env.feature_names, env.df = self.data_dict[symbol]
+        env.spec = SYMBOLS[symbol]
+        env.current_step = env.lookback + len(env.df) - 3000  # use last part of data
+        env.reset()
+
+        obs = env._get_obs()
+        for step in range(500):
+            if env.current_step >= len(env.df) - 1:
+                break
+            mask = env.get_action_mask()
+            action, _, _ = self.agent.get_action(obs, action_mask=mask, temperature=0.7)
+            obs, reward, done, info = env.step(action)
+            if done:
+                break
+
+        pnl = (env.balance - FTMO_CONFIG['account_size']) / FTMO_CONFIG['account_size'] * 100
+        wr = env.winning_trades / max(1, env.total_trades) * 100
+        dd = (env.peak_equity - env.balance) / FTMO_CONFIG['account_size'] * 100 if hasattr(env, 'peak_equity') else 0
+
+        # use daily dd if peak_equity not available
+        if 'peak_equity' not in dir(env) or dd == 0:
+            dd = max(0, (env.daily_start_balance - env.balance) / FTMO_CONFIG['account_size'] * 100)
+
+        return pnl, env.total_trades, wr, dd, f"{env.buy_trades}/{env.sell_trades}"
+
+
+if __name__ == "__main__":
+    trainer = V4Trainer(n_episodes=3000)
+    trainer.run()

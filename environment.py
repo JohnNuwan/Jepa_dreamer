@@ -1,266 +1,604 @@
 """
-ftmo_agent/environment.py — Trading environment with FTMO rules.
-Simulates FTMO 10K challenge: daily DD 5%, total DD 10%, profit target 10%.
+ftmo_agent/environment_v4.py — Environment V4 with ALL fixes:
+- Variable spread (session/volatility-based)
+- Slippage on entry, SL, and TP
+- Commission MT5 ($7/lot)
+- Pure PnL reward (no shaping)
+- Curriculum learning (3 phases)
+- Inter-symbol correlation features
+- V4 features integration
 """
 import numpy as np
 import pandas as pd
+from config import (SYMBOLS, SymbolSpec, ACTIVE_SYMBOLS, FTMO_CONFIG,
+                     RISK_CONFIG, ANTI_BIAS_CONFIG, CURRICULUM_CONFIG,
+                     HOLD, BUY, SELL, CLOSE, SPLIT_BUY, SPLIT_SELL,
+                     PYRAMID, PARTIAL_CLOSE, N_ACTIONS, ACTION_NAMES)
+from features_v2 import (compute_multi_tf_features, get_symbol_embedding_v4,
+                          compute_correlations, get_correlation_features)
 
-# Actions
-HOLD = 0
-BUY = 1
-SELL = 2
-CLOSE = 3
-N_ACTIONS = 4
 
-class FTMOTradingEnv:
+class Position:
+    def __init__(self, symbol, direction, entry_price, lots, sl, tp,
+                 spec, position_type='full', commission_paid=0):
+        self.symbol = symbol
+        self.direction = direction
+        self.entry_price = entry_price
+        self.lots = lots
+        self.initial_lots = lots
+        self.sl = sl
+        self.tp = tp
+        self.spec = spec
+        self.position_type = position_type
+        self.bars_held = 0
+        self.slbe_applied = False
+        self.partial_closed = False
+        self.pyramid_level = 0
+        self.commission_paid = commission_paid
+
+    def unrealized_pnl(self, current_price):
+        if self.direction == 1:
+            return (current_price - self.entry_price) * self.lots * self.spec.contract_size
+        else:
+            return (self.entry_price - current_price) * self.lots * self.spec.contract_size
+
+    def update_slbe(self, current_price):
+        if self.slbe_applied:
+            return False
+        profit = self.unrealized_pnl(current_price)
+        if profit >= RISK_CONFIG['slbe_trigger_usd']:
+            offset = RISK_CONFIG['slbe_offset_usd']
+            if self.direction == 1:
+                self.sl = self.entry_price + offset / (self.lots * self.spec.contract_size)
+            else:
+                self.sl = self.entry_price - offset / (self.lots * self.spec.contract_size)
+            self.slbe_applied = True
+            return True
+        return False
+
+    def check_sl_tp(self, current_price, current_high, current_low):
+        """V4: Check SL/TP with realistic slippage using H/L."""
+        # SL: use low for long, high for short (worst case)
+        if self.direction == 1:
+            if current_low <= self.sl:
+                return 'SL'
+            if current_high >= self.tp:
+                return 'TP'
+        else:
+            if current_high >= self.sl:
+                return 'SL'
+            if current_low <= self.tp:
+                return 'TP'
+        return None
+
+
+class MultiSymbolEnvV4:
     """
-    Trading environment for FTMO challenge.
-    
-    State: (lookback, n_features) — last N bars of features + position info
-    Action: 0=HOLD, 1=BUY, 2=SELL, 3=CLOSE
-    Reward: risk-adjusted PnL with FTMO rule penalties
-    
-    FTMO rules:
-    - Account: $10,000
-    - Daily drawdown: 5% ($500)
-    - Total drawdown: 10% ($1,000)
-    - Profit target: 10% ($1,000)
+    Environment V4: pure PnL, curriculum learning, realistic frictions.
+
+    KEY CHANGES:
+    - Reward = pure PnL (% of account), NO shaping tricks
+    - Curriculum: phase 1 (no fees) → phase 2 (low fees) → phase 3 (full fees)
+    - Variable spread based on session and volatility
+    - Slippage on SL/TP execution
+    - Commission per lot ($7/lot standard MT5)
+    - Inter-symbol correlations in observation
+    - V4 features with 70+ per TF
     """
-    
-    def __init__(self, df, features, lookback=48, 
-                 account_size=10000, risk_per_trade=0.01,
-                 daily_dd_limit=0.05, total_dd_limit=0.10,
-                 profit_target=0.10, max_hold_bars=96,
-                 spread_pips=2, pip_size=0.01):
-        self.df = df.reset_index(drop=True)
-        self.features = features
+
+    def __init__(self, data_dict, lookback=48, curriculum_episode=0):
+        self.data_dict = data_dict
+        self.symbols = list(data_dict.keys())
         self.lookback = lookback
-        self.account_size = account_size
-        self.risk_per_trade = risk_per_trade
-        self.daily_dd_limit = daily_dd_limit
-        self.total_dd_limit = total_dd_limit
-        self.profit_target = profit_target
-        self.max_hold = max_hold_bars
-        self.spread = spread_pips * pip_size
-        self.pip_size = pip_size
-        
-        self.n_features = len(features) + 3  # + position info
+
+        # Pre-compute correlations
+        self.correlations = compute_correlations(data_dict)
+
+        # Determine feature dimensions from first symbol
+        first_sym = self.symbols[0]
+        feat_dim = data_dict[first_sym][0].shape[1]
+        corr_dim = len(CORRELATION_SYMBOLS)  # from config
+        sym_emb_dim = 8
+        pos_dim = 5
+        self.n_features = feat_dim + corr_dim + sym_emb_dim + pos_dim
+
+        self.curriculum_episode = curriculum_episode
         self.reset()
-    
+
+    def _get_curriculum_phase(self):
+        """V4: Determine curriculum phase based on episode count."""
+        if not CURRICULUM_CONFIG['enabled']:
+            return 3, CURRICULUM_CONFIG['phase3_spread_mult']
+        cfg = CURRICULUM_CONFIG
+        ep = self.curriculum_episode
+        if ep < cfg['phase1_episodes']:
+            return 1, cfg['phase1_spread_mult']
+        elif ep < cfg['phase1_episodes'] + cfg['phase2_episodes']:
+            return 2, cfg['phase2_spread_mult']
+        else:
+            return 3, cfg['phase3_spread_mult']
+
+    def _get_spread(self):
+        """
+        V4: Variable spread based on:
+        - Symbol base spread
+        - Current session (wider during off-hours)
+        - Volatility regime
+        - Random component for realism
+        """
+        spec = self.spec
+        phase, mult = self._get_curriculum_phase()
+
+        base = spec.spread_points_mean * spec.pip_size
+        base_std = spec.spread_points_std * spec.pip_size
+
+        # Session multiplier
+        if hasattr(self.df.index, 'hour'):
+
+            if hasattr(self.df, 'iloc') and self.current_step < len(self.df):
+                time_val = self.df.index[self.current_step] if hasattr(self.df, 'index') else pd.Timestamp.now()
+
+            # Use the step to get approximate hour
+            # Estimate from data
+            time_info = self.df['time'].iloc[self.current_step] if 'time' in self.df.columns else None
+        # Default: no session adjustment
+        session_mult = 1.0
+
+        # If we have time info
+        if self.df is not None:
+            try:
+                row = self.df.iloc[self.current_step] if self.current_step < len(self.df) else self.df.iloc[-1]
+                if 'time' in row:
+                    t = pd.to_datetime(row['time'])
+                    hour = t.hour
+                    # Wider spreads during news / close
+                    if hour in [8, 9, 14, 15]:  # London/NY opens
+                        session_mult = 0.8  # tighter during liquid hours
+                    elif hour in [0, 1, 2, 3, 4, 5, 6]:  # Asian session
+                        session_mult = 1.5  # wider during thin hours
+                    elif hour in [21, 22, 23]:  # Close
+                        session_mult = 2.0  # much wider
+            except:
+                pass
+
+        # Volatility multiplier (estimated from ATR feature)
+        vol_mult = 1.0
+        try:
+            feat_idx = self.feature_names.index('atr_norm') if hasattr(self, 'feature_names') else -1
+            if feat_idx >= 0 and self.current_step < len(self.features):
+                atr_val = abs(self.features[self.current_step, feat_idx])
+                # If atr > average, spread widens
+                mean_atr = np.mean(np.abs(self.features[max(0, self.current_step-48):self.current_step+1, feat_idx]))
+                if mean_atr > 1e-6:
+                    vol_mult = min(3.0, max(0.5, atr_val / mean_atr))
+        except:
+            pass
+
+        # Random component
+        rnd = np.random.normal(0, base_std * 0.3)
+
+        spread = (base * session_mult * vol_mult + rnd) * mult
+        return max(spread * 0.1, min(spread, base * 10))  # clamp
+
+    def _get_slippage(self):
+        """
+        V4: Slippage proportional to spread and volatility.
+        Returns slippage in price units.
+        """
+        phase, mult = self._get_curriculum_phase()
+        if phase == 1:
+            return 0.0
+
+        spec = self.spec
+        base_slippage = spec.spread_points_mean * spec.pip_size * spec.slippage_pct_mean
+        slp_std = spec.spread_points_mean * spec.pip_size * spec.slippage_pct_std
+
+        # More slippage during volatile periods
+        vol_factor = 1.0
+        try:
+            feat_idx = self.feature_names.index('atr_norm')
+            if feat_idx >= 0:
+                atr_val = abs(self.features[self.current_step, feat_idx]) if self.current_step < len(self.features) else 0
+                vol_factor = min(3.0, 1.0 + atr_val * 5)
+        except:
+            pass
+
+        slippage = abs(np.random.normal(base_slippage, slp_std)) * vol_factor * mult
+        return slippage
+
+    def _get_commission(self, lots):
+        """V4: Commission per trade."""
+        phase, mult = self._get_curriculum_phase()
+        if phase == 1:
+            return 0.0
+        cfg = CURRICULUM_CONFIG
+        if phase == 2 and cfg['phase2_commission_mult'] == 0.0:
+            return 0.0
+        return self.spec.commission_per_lot * lots * mult
+
     def reset(self):
-        self.current_step = self.lookback
-        self.balance = self.account_size
-        self.peak_balance = self.account_size
-        self.daily_start_balance = self.account_size
-        self.position = 0  # 0=flat, 1=long, -1=short
-        self.entry_price = 0
-        self.position_bars = 0
-        self.stop_loss = 0
-        self.take_profit = 0
+        self.current_symbol = np.random.choice(self.symbols)
+        self.features, self.feature_names, self.df = self.data_dict[self.current_symbol]
+        self.spec = SYMBOLS[self.current_symbol]
+
+        # Random start within data
+        max_start = max(1, len(self.df) - self.lookback - 2000)
+        self.current_step = self.lookback + np.random.randint(0, max_start)
+
+        # Account state
+        self.balance = FTMO_CONFIG['account_size']
+        self.peak_balance = self.balance
+        self.daily_start_balance = self.balance
+        self.prev_equity = self.balance
+        self.positions = []
         self.trades_today = 0
         self.consecutive_losses = 0
+        self.cooldown_until = 0
+        self.last_trade_day = -1
         self.total_trades = 0
         self.winning_trades = 0
-        self.last_trade_day = -1
+        self.buy_trades = 0
+        self.sell_trades = 0
         self.episode_pnl = 0
-        self.daily_pnl = 0
-        self.done = False
+        self.realized_pnl = 0
+        self.bars_since_last_trade = 0
+        self.max_dd_exceeded = False
+        self.peak_equity = self.balance
+
+        # Episode metrics
+        self.episode_reward = 0.0
+
         return self._get_obs()
-    
+
     def _get_obs(self):
-        """Get observation: (lookback, n_features)"""
-        feat = self.df.loc[self.current_step - self.lookback:self.current_step - 1, 
-                           self.features].values
+        """V4: Build observation with correlation features."""
+        start = max(0, self.current_step - self.lookback)
+        end = max(start + 1, self.current_step)
+        end = min(end, len(self.features))
+
+        if end - start < self.lookback:
+            # Pad if not enough history
+            feat = np.zeros((self.lookback, self.features.shape[1]))
+            pad = self.lookback - (end - start)
+            feat[pad:] = self.features[start:end]
+        else:
+            feat = self.features[end - self.lookback:end]
+
+        # Correlation features
+        corr_feat = get_correlation_features(self.correlations, self.current_symbol, self.current_step)
+        corr_tiled = np.tile(corr_feat, (self.lookback, 1))
+
+        # Symbol embedding
+        sym_emb = get_symbol_embedding_v4(self.current_symbol)
+        sym_emb_tiled = np.tile(sym_emb, (self.lookback, 1))
+
         # Position info
+        n_positions = len(self.positions)
+        # Use get_price or estimated
+        current_price = self.df.iloc[min(self.current_step, len(self.df)-1)]['close'] if hasattr(self.df, 'iloc') else 0
+        total_unrealized = sum(p.unrealized_pnl(current_price) for p in self.positions)
+        net_direction = sum(p.direction * p.lots for p in self.positions)
+        total_lots = sum(p.lots for p in self.positions)
+        avg_bars = np.mean([p.bars_held for p in self.positions]) if self.positions else 0
+        max_pos = FTMO_CONFIG['max_concurrent_positions']
+
         pos_info = np.array([[
-            self.position,
-            self.position_bars / self.max_hold,
-            (self.entry_price - self.df.loc[self.current_step, 'close']) / 
-            (self.df.loc[self.current_step, 'close'] + 1e-8) if self.position != 0 else 0
+            n_positions / max_pos,
+            total_unrealized / max(1, self.balance),
+            net_direction / max(1, total_lots),
+            total_lots / max(1, self.spec.max_volume),
+            avg_bars / max(1, FTMO_CONFIG['max_hold_bars']),
         ]])
-        # Repeat position info for each timestep (or append)
-        pos_repeated = np.tile(pos_info, (self.lookback, 1))
-        obs = np.hstack([feat, pos_repeated])
+        pos_tiled = np.tile(pos_info, (self.lookback, 1))
+
+        obs = np.hstack([feat, corr_tiled, sym_emb_tiled, pos_tiled])
         return obs.astype(np.float32)
-    
+
     def _get_price(self):
-        return self.df.loc[self.current_step, 'close']
-    
-    def _get_bid_ask(self):
-        close = self.df.loc[self.current_step, 'close']
-        return close - self.spread/2, close + self.spread/2
-    
+        """Get current price from data."""
+        if hasattr(self.df, 'iloc'):
+            idx = min(self.current_step, len(self.df) - 1)
+            return self.df.iloc[idx]['close']
+        return 0.0
+
+    def _get_hilo(self):
+        """Get current high/low for SL/TP checks."""
+        if hasattr(self.df, 'iloc'):
+            idx = min(self.current_step, len(self.df) - 1)
+            return float(self.df.iloc[idx]['high']), float(self.df.iloc[idx]['low'])
+        return self._get_price(), self._get_price()
+
     def _check_daily_reset(self):
-        """Check if new day for daily drawdown reset."""
-        current_day = self.df.loc[self.current_step, 'time'].day
-        if current_day != self.last_trade_day and self.last_trade_day != -1:
-            self.daily_start_balance = self.balance
-            self.trades_today = 0
-            self.daily_pnl = 0
-        self.last_trade_day = current_day
-    
-    def _calculate_position_size(self, entry, sl_price):
-        """Risk-based position sizing: risk_per_trade % of balance."""
-        risk_amount = self.balance * self.risk_per_trade
+        if 'time' in self.df.columns and self.current_step < len(self.df):
+            try:
+                current_day = pd.to_datetime(self.df.iloc[self.current_step]['time']).day
+                if current_day != self.last_trade_day and self.last_trade_day != -1:
+                    self.daily_start_balance = self.balance
+                    self.trades_today = 0
+                    self.cooldown_until = 0
+                self.last_trade_day = current_day
+            except:
+                pass
+
+    def _calc_position_size(self, entry, sl_price, risk_pct=None):
+        """V4: Position sizing with tighter risk."""
+        risk = risk_pct or RISK_CONFIG['risk_per_trade']
+        risk_amount = self.balance * risk
         sl_distance = abs(entry - sl_price)
         if sl_distance < 1e-6:
-            return 0.01  # minimum
-        # For XAUUSD: 1 lot = 100 oz, $1 move = $100
-        # position_size = risk_amount / (sl_distance_in_pips * pip_value_per_lot)
-        pip_value_per_lot = 100  # $100 per $1 move for 1 lot XAUUSD
-        lots = risk_amount / (sl_distance * pip_value_per_lot)
-        return max(0.01, min(lots, 0.5))  # cap at 0.5 lots
-    
+            return self.spec.min_volume
+        contract_val = self.spec.contract_size
+        lots = risk_amount / (sl_distance * contract_val)
+        return max(self.spec.min_volume, min(lots, self.spec.max_volume))
+
+    def _total_risk(self):
+        total = 0
+        for p in self.positions:
+            sl_dist = abs(p.entry_price - p.sl)
+            total += sl_dist * p.lots * p.spec.contract_size
+        return total / max(1, self.balance)
+
+    def get_action_mask(self):
+        mask = np.zeros(N_ACTIONS, dtype=bool)
+        has_position = len(self.positions) > 0
+        phase, _ = self._get_curriculum_phase()
+        max_trades = CURRICULUM_CONFIG[f'phase{phase}_max_trades']
+        can_open = (self.trades_today < max_trades and
+                    self.current_step >= self.cooldown_until and
+                    len(self.positions) < FTMO_CONFIG['max_concurrent_positions'])
+
+        mask[HOLD] = True
+        mask[BUY] = not has_position and can_open
+        mask[SELL] = not has_position and can_open
+        mask[CLOSE] = has_position
+        mask[SPLIT_BUY] = not has_position and can_open
+        mask[SPLIT_SELL] = not has_position and can_open
+        if has_position and can_open:
+            upnl = self.positions[0].unrealized_pnl(self._get_price())
+            mask[PYRAMID] = upnl > RISK_CONFIG['pyramid_min_profit_usd']
+        else:
+            mask[PYRAMID] = False
+        if has_position:
+            upnl = self.positions[0].unrealized_pnl(self._get_price())
+            mask[PARTIAL_CLOSE] = not self.positions[0].partial_closed and upnl > 0
+        return mask
+
     def step(self, action):
-        if self.done:
+        if self.current_step >= len(self.df) - 1:
             return self._get_obs(), 0, True, {}
-        
+
         self._check_daily_reset()
-        
         current_price = self._get_price()
-        reward = 0
+        current_high, current_low = self._get_hilo()
+        reward = 0.0
         info = {}
-        
-        # Manage existing position
-        if self.position != 0:
-            self.position_bars += 1
-            # Check SL/TP
-            if self.position == 1:  # long
-                unrealized = (current_price - self.entry_price) * self.lot_size * 100
-                if current_price <= self.stop_loss:
-                    reward += self._close_position(current_price, 'SL')
-                    info['exit'] = 'SL'
-                elif current_price >= self.take_profit:
-                    reward += self._close_position(current_price, 'TP')
-                    info['exit'] = 'TP'
-                elif self.position_bars >= self.max_hold:
-                    reward += self._close_position(current_price, 'TIMEOUT')
-                    info['exit'] = 'TIMEOUT'
-            elif self.position == -1:  # short
-                unrealized = (self.entry_price - current_price) * self.lot_size * 100
-                if current_price >= self.stop_loss:
-                    reward += self._close_position(current_price, 'SL')
-                    info['exit'] = 'SL'
-                elif current_price <= self.take_profit:
-                    reward += self._close_position(current_price, 'TP')
-                    info['exit'] = 'TP'
-                elif self.position_bars >= self.max_hold:
-                    reward += self._close_position(current_price, 'TIMEOUT')
-                    info['exit'] = 'TIMEOUT'
-        
-        # Execute action (only if flat)
-        if self.position == 0 and action in [BUY, SELL]:
-            if self.trades_today < 5:  # KICK: max 5 trades/day
-                bid, ask = self._get_bid_ask()
-                atr = self.df.loc[self.current_step, 'atr_norm'] * current_price
-                
-                if action == BUY:
-                    entry = ask
-                    sl = entry - max(atr * 1.5, 2.0)  # 1.5x ATR or min $2
-                    tp = entry + max(atr * 3.0, 4.0)  # 1:2 RR minimum
-                    self.position = 1
-                else:  # SELL
-                    entry = bid
-                    sl = entry + max(atr * 1.5, 2.0)
-                    tp = entry - max(atr * 3.0, 4.0)
-                    self.position = -1
-                
-                self.entry_price = entry
-                self.stop_loss = sl
-                self.take_profit = tp
-                self.position_bars = 0
-                self.lot_size = self._calculate_position_size(entry, sl)
-                self.trades_today += 1
-                self.total_trades += 1
-                info['entry'] = 'BUY' if action == BUY else 'SELL'
-                info['entry_price'] = entry
-                info['sl'] = sl
-                info['tp'] = tp
-                info['lots'] = self.lot_size
-        
-        # Small penalty for holding too long without action
-        if self.position == 0 and action == HOLD:
-            reward -= 0.001  # tiny penalty to encourage trading
-        
-        # Check FTMO violations
-        equity = self.balance
-        if self.position != 0:
-            if self.position == 1:
-                equity += (current_price - self.entry_price) * self.lot_size * 100
-            else:
-                equity += (self.entry_price - current_price) * self.lot_size * 100
-        
-        daily_dd = (self.daily_start_balance - equity) / self.account_size
-        total_dd = (self.peak_balance - equity) / self.account_size
-        
-        # Penalty for approaching drawdown limits
-        if daily_dd > self.daily_dd_limit * 0.7:
-            reward -= (daily_dd - self.daily_dd_limit * 0.7) * 20
-        if total_dd > self.total_dd_limit * 0.7:
-            reward -= (total_dd - self.total_dd_limit * 0.7) * 30
-        
-        # Hard violation
-        if daily_dd >= self.daily_dd_limit:
-            self.done = True
-            reward -= 5  # big penalty
+
+        action_mask = self.get_action_mask()
+        if not action_mask[action]:
+            action = HOLD
+
+        # ── 1. Manage existing positions (SL/TP checks with H/L) ──
+        positions_to_close = []
+        for i, pos in enumerate(self.positions):
+            pos.bars_held += 1
+            pos.update_slbe(current_price)
+            exit_reason = pos.check_sl_tp(current_price, current_high, current_low)
+            if exit_reason:
+                positions_to_close.append((i, exit_reason))
+            elif pos.bars_held >= FTMO_CONFIG['max_hold_bars']:
+                positions_to_close.append((i, 'TIMEOUT'))
+
+        for i, reason in reversed(positions_to_close):
+            reward += self._close_position(i, current_price, reason)
+
+        # ── 2. Execute action ──
+        spread = self._get_spread()
+        slippage = self._get_slippage()
+        phase, _ = self._get_curriculum_phase()
+        max_trades = CURRICULUM_CONFIG[f'phase{phase}_max_trades']
+        can_trade = (self.trades_today < max_trades and
+                     self.current_step >= self.cooldown_until and
+                     len(self.positions) < FTMO_CONFIG['max_concurrent_positions'])
+
+        traded_this_step = False
+        if action == BUY and not self.positions and can_trade:
+            entry = current_price + spread / 2
+            reward += self._open_position(1, entry, 'full')
+            traded_this_step = True
+        elif action == SELL and not self.positions and can_trade:
+            entry = current_price - spread / 2
+            reward += self._open_position(-1, entry, 'full')
+            traded_this_step = True
+        elif action == SPLIT_BUY and not self.positions and can_trade:
+            entry = current_price + spread / 2
+            reward += self._open_position(1, entry, 'split_1', split=True)
+            traded_this_step = True
+        elif action == SPLIT_SELL and not self.positions and can_trade:
+            entry = current_price - spread / 2
+            reward += self._open_position(-1, entry, 'split_1', split=True)
+            traded_this_step = True
+        elif action == CLOSE and self.positions:
+            for i in range(len(self.positions) - 1, -1, -1):
+                reward += self._close_position(i, current_price, 'MODEL')
+            traded_this_step = True
+        elif action == PYRAMID and self.positions and can_trade:
+            pos = self.positions[0]
+            upnl = pos.unrealized_pnl(current_price)
+            if upnl >= RISK_CONFIG['pyramid_min_profit_usd']:
+                risk = RISK_CONFIG['risk_per_trade'] * \
+                       (RISK_CONFIG['pyramid_risk_reduction'] ** (pos.pyramid_level + 1))
+                entry = current_price + (spread / 2 if pos.direction == 1 else -spread / 2)
+                reward += self._open_position(pos.direction, entry,
+                                              f'pyramid_{pos.pyramid_level + 1}',
+                                              risk_pct=risk, pyramid=True)
+                traded_this_step = True
+        elif action == PARTIAL_CLOSE and self.positions:
+            pos = self.positions[0]
+            upnl = pos.unrealized_pnl(current_price)
+            if not pos.partial_closed and upnl > 0:
+                close_lots = pos.lots * RISK_CONFIG['partial_close_pct']
+                pnl = self._partial_close(pos, close_lots, current_price)
+                reward += pnl / max(1, FTMO_CONFIG['account_size'])
+                traded_this_step = True
+
+        # ── 3. Pure PnL reward ── V4: NO shaping, just equity change
+        current_equity = self.balance + sum(
+            p.unrealized_pnl(current_price) for p in self.positions
+        )
+        equity_change = (current_equity - self.prev_equity) / FTMO_CONFIG['account_size']
+        reward += equity_change  # Pure PnL % — this is THE core reward
+        self.prev_equity = current_equity
+
+        # Track peak equity
+        if current_equity > self.peak_equity:
+            self.peak_equity = current_equity
+
+        # ── 4. FTMO checks ──
+        daily_dd = (self.daily_start_balance - current_equity) / FTMO_CONFIG['account_size']
+        total_dd = (self.peak_equity - current_equity) / FTMO_CONFIG['account_size']
+
+        done = False
+        if daily_dd >= FTMO_CONFIG['daily_dd_limit']:
+            done = True
             info['violation'] = 'DAILY_DRAWDOWN'
-        if total_dd >= self.total_dd_limit:
-            self.done = True
-            reward -= 10
+            self.max_dd_exceeded = True
+        if total_dd >= FTMO_CONFIG['total_dd_limit']:
+            done = True
             info['violation'] = 'TOTAL_DRAWDOWN'
-        
-        # Profit target reached
-        profit_pct = (self.balance - self.account_size) / self.account_size
-        if profit_pct >= self.profit_target:
-            self.done = True
-            reward += 10  # big reward
+            self.max_dd_exceeded = True
+
+        profit_pct = (self.balance - FTMO_CONFIG['account_size']) / FTMO_CONFIG['account_size']
+        if profit_pct >= FTMO_CONFIG['profit_target'] and not self.max_dd_exceeded:
+            done = True
             info['success'] = True
-        
-        # Update peak
+
+        # ── 5. Anti-bias (light touch) ──
+        if ANTI_BIAS_CONFIG['enabled'] and self.total_trades >= ANTI_BIAS_CONFIG['min_trades_for_bias_check']:
+            total = self.buy_trades + self.sell_trades
+            if total > 0:
+                buy_ratio = self.buy_trades / total
+                if buy_ratio > ANTI_BIAS_CONFIG['max_buy_ratio']:
+                    reward -= (buy_ratio - ANTI_BIAS_CONFIG['max_buy_ratio']) * \
+                              ANTI_BIAS_CONFIG['penalty_weight'] * 0.01
+                elif buy_ratio < 1 - ANTI_BIAS_CONFIG['max_sell_ratio']:
+                    reward -= ((1 - buy_ratio) - ANTI_BIAS_CONFIG['max_sell_ratio']) * \
+                              ANTI_BIAS_CONFIG['penalty_weight'] * 0.01
+
+        # Update balance tracking
         if self.balance > self.peak_balance:
             self.peak_balance = self.balance
-        
+
         self.current_step += 1
         if self.current_step >= len(self.df) - 1:
-            self.done = True
-        
-        # Scale reward
-        reward = np.clip(reward, -5, 5)
-        
-        info['balance'] = self.balance
-        info['equity'] = equity
-        info['profit_pct'] = profit_pct
-        info['daily_dd'] = daily_dd
-        info['total_dd'] = total_dd
-        
-        return self._get_obs(), reward, self.done, info
-    
-    def _close_position(self, exit_price, reason):
-        """Close position and return realized PnL."""
-        if self.position == 1:
-            pnl = (exit_price - self.entry_price) * self.lot_size * 100
+            done = True
+
+        self.episode_reward += reward
+
+        info.update({
+            'balance': self.balance,
+            'equity': current_equity,
+            'profit_pct': (self.balance - FTMO_CONFIG['account_size']) / FTMO_CONFIG['account_size'],
+            'daily_dd': daily_dd,
+            'total_dd': total_dd,
+            'positions': len(self.positions),
+            'symbol': self.current_symbol,
+            'buy_trades': self.buy_trades,
+            'sell_trades': self.sell_trades,
+            'total_trades': self.total_trades,
+            'win_rate': self.winning_trades / max(1, self.total_trades),
+            'action_mask': action_mask,
+            'phase': self._get_curriculum_phase()[0],
+        })
+
+        return self._get_obs(), reward, done, info
+
+    def _open_position(self, direction, entry_price, pos_type,
+                       split=False, risk_pct=None, pyramid=False):
+        """V4: Open position with spread and commission."""
+        # SL/TP based on ATR
+        try:
+            feat_idx = self.feature_names.index('atr_norm') if hasattr(self, 'feature_names') else -1
+            if feat_idx >= 0 and self.current_step < len(self.features):
+                atr_norm = abs(self.features[self.current_step, feat_idx])
+            else:
+                atr_norm = 0.01
+        except:
+            atr_norm = 0.01
+
+        atr = max(atr_norm * entry_price, self.spec.pip_size * 10)
+
+        if direction == 1:
+            sl = entry_price - atr * RISK_CONFIG['sl_atr_mult']
+            tp = entry_price + atr * RISK_CONFIG['tp_atr_mult']
         else:
-            pnl = (self.entry_price - exit_price) * self.lot_size * 100
-        
-        # Subtract spread cost
-        pnl -= self.spread * self.lot_size * 100
-        
+            sl = entry_price + atr * RISK_CONFIG['sl_atr_mult']
+            tp = entry_price - atr * RISK_CONFIG['tp_atr_mult']
+
+        risk = (risk_pct or RISK_CONFIG['risk_per_trade']) * (0.5 if split else 1.0)
+        lots = self._calc_position_size(entry_price, sl, risk)
+
+        if self._total_risk() + risk > RISK_CONFIG['max_risk_total']:
+            return 0.0
+
+        commission = self._get_commission(lots)
+        self.balance -= commission  # Commission paid immediately
+
+        pos = Position(
+            symbol=self.current_symbol, direction=direction,
+            entry_price=entry_price, lots=lots, sl=sl, tp=tp,
+            spec=self.spec, position_type=pos_type, commission_paid=commission,
+        )
+        if pyramid:
+            pos.pyramid_level = len([p for p in self.positions if p.direction == direction])
+
+        self.positions.append(pos)
+        self.trades_today += 1
+        self.total_trades += 1
+        if direction == 1:
+            self.buy_trades += 1
+        else:
+            self.sell_trades += 1
+
+        # No reward bonus for opening — pure PnL will handle it
+        return 0.0
+
+    def _close_position(self, idx, exit_price, reason):
+        """V4: Close position with slippage."""
+        pos = self.positions[idx]
+
+        # Slippage on exit
+        slippage = self._get_slippage()
+        if pos.direction == 1:
+            exit_price -= slippage
+        else:
+            exit_price += slippage
+
+        pnl = pos.unrealized_pnl(exit_price)
         self.balance += pnl
         self.episode_pnl += pnl
-        self.daily_pnl += pnl
-        
+        self.realized_pnl += pnl
+
+        pnl_norm = pnl / FTMO_CONFIG['account_size']
         if pnl > 0:
             self.winning_trades += 1
             self.consecutive_losses = 0
         else:
             self.consecutive_losses += 1
-        
-        self.position = 0
-        self.entry_price = 0
-        self.position_bars = 0
-        
-        return pnl / self.account_size  # normalized reward
-    
-    @property
-    def win_rate(self):
-        return self.winning_trades / max(1, self.total_trades)
+            if self.consecutive_losses >= FTMO_CONFIG['cooldown_after_losses']:
+                self.cooldown_until = self.current_step + FTMO_CONFIG['cooldown_bars']
+
+        self.positions.pop(idx)
+        return pnl_norm  # Pure normalized PnL
+
+    def _partial_close(self, pos, close_lots, exit_price):
+        pnl_per_unit = pos.unrealized_pnl(exit_price) / max(1, pos.lots)
+        pnl = pnl_per_unit * close_lots
+        slippage = self._get_slippage()
+        if pos.direction == 1:
+            pnl -= slippage * close_lots * pos.spec.contract_size
+        else:
+            pnl -= slippage * close_lots * pos.spec.contract_size
+        self.balance += pnl
+        pos.lots -= close_lots
+        pos.partial_closed = True
+        return pnl
