@@ -1,0 +1,40 @@
+# FTMO Agent gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Checkpoints (large files, regenerate on training)
+checkpoints/
+checkpoints_*/
+checkpoints*/**/*.pt
+
+# Logs
+*.log
+
+# Data (downloaded, not committed)
+data/
+*.csv
+*.parquet
+*.h5
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config with potential secrets
+.env
+*.env
