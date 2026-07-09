@@ -1,10 +1,11 @@
 """
-train_es.py — Evolution Strategies : population d'agents évaluée en parallèle.
-Sélection naturelle sur le PnL, pas de critic, pas de backprop complexe.
+train_es.py — Evolution Strategies V2 : antithetic sampling, pénalité zéro-trade.
+Population évaluée avec antithetic variates pour un gradient 2× plus précis.
 """
 import sys, os, time, json
 import numpy as np
 import pandas as pd
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -19,7 +20,8 @@ def load_all_symbols(data_dir='data'):
     data_dict = {}
     for symbol in ACTIVE_SYMBOLS:
         path = os.path.join(data_dir, f'{symbol}_m15.csv')
-        if not os.path.exists(path): continue
+        if not os.path.exists(path):
+            continue
         df = pd.read_csv(path)
         df['time'] = pd.to_datetime(df['time'])
         df = df.sort_values('time').reset_index(drop=True)
@@ -30,8 +32,8 @@ def load_all_symbols(data_dir='data'):
 
 
 class ESTrainer:
-    def __init__(self, n_generations=500, pop_size=16, eval_steps=500,
-                 hidden_dim=128, sigma=0.03, lr=0.02, save_dir='checkpoints_es'):
+    def __init__(self, n_generations=500, pop_size=16, eval_steps=2000,
+                 hidden_dim=128, sigma=0.015, lr=0.01, save_dir='checkpoints_es'):
         self.n_generations = n_generations
         self.pop_size = pop_size
         self.eval_steps = eval_steps
@@ -51,7 +53,8 @@ class ESTrainer:
                              action_dim=N_ACTIONS, pop_size=pop_size, sigma=sigma,
                              lr=lr, elite_frac=0.25, device='cuda:0')
         
-        self.best_fitness = -float('inf')
+        self.best_val_pnl = -float('inf')
+        self.best_val_gen = 0
         self.log_path = os.path.join(save_dir, 'training_es.log')
         self.metrics_path = os.path.join(save_dir, 'metrics_es.json')
         self.metrics = []
@@ -62,11 +65,10 @@ class ESTrainer:
     
     def run(self):
         log_file = open(self.log_path, 'w')
-        print(f"\n=== ES Training ({self.n_generations} gens, pop={self.pop_size}) ===")
+        print(f"\n=== ES Training V2 ({self.n_generations} gens, pop={self.pop_size}) ===")
         print(f"   {self.eval_steps} steps/eval, σ={self.agent.sigma}, lr={self.agent.lr}")
+        print(f"   Antithetic: ON | Zero-trade penalty: -100 | Déterministe: ON")
         print()
-        
-        best_policy = None
         
         for gen in range(self.n_generations):
             t0 = time.time()
@@ -74,15 +76,20 @@ class ESTrainer:
             # Créer environnements
             envs = self._create_envs(gen)
             
-            # Évaluer la population
-            fitness = self.agent.evaluate_population(envs, steps=self.eval_steps)
+            # Évaluer la population (retourne effective_fitness, fitness_plus, fitness_minus)
+            effective_fitness, fitness_plus, fitness_minus = \
+                self.agent.evaluate_population(envs, steps=self.eval_steps)
             
-            # Évoluer
-            evo_metrics = self.agent.evolve(fitness)
+            # Stats debug
+            trades_plus = sum(1 for f in fitness_plus if f > -50)
+            trades_minus = sum(1 for f in fitness_minus if f > -50)
             
-            # Validation avec la meilleure politique
+            # Évoluer sur la fitness effective
+            evo_metrics = self.agent.evolve(effective_fitness)
+            
+            # Validation avec la meilleure politique (toutes les 5 gens pour plus de feedback)
             val_pnl, val_trades, val_wr = 0, 0, 0
-            if gen % 10 == 0:
+            if gen % 5 == 0:
                 val_pnl, val_trades, val_wr = self._validate()
             
             # Log
@@ -91,6 +98,7 @@ class ESTrainer:
                    f"best={evo_metrics['best_fitness']:+.2f} "
                    f"mean={evo_metrics['mean_fitness']:+.2f} "
                    f"elite={evo_metrics['elite_mean']:+.2f} "
+                   f"t±={trades_plus}/{trades_minus} "
                    f"| val={val_pnl:+.2f}% tr={val_trades} wr={val_wr:.0f}%")
             print(log)
             log_file.write(log + '\n')
@@ -101,24 +109,27 @@ class ESTrainer:
                 **{k: round(v, 4) if isinstance(v, float) else v for k, v in evo_metrics.items()},
                 'val_pnl': round(val_pnl, 2),
                 'val_trades': val_trades,
+                'trades_plus': trades_plus,
+                'trades_minus': trades_minus,
             })
             
             if gen % 50 == 0:
                 with open(self.metrics_path, 'w') as f:
                     json.dump(self.metrics, f, indent=2)
             
-            if val_pnl > self.best_fitness:
-                self.best_fitness = val_pnl
-                best_policy = self.agent.get_best_policy()
+            if val_pnl > self.best_val_pnl:
+                self.best_val_pnl = val_pnl
+                self.best_val_gen = gen
                 self.agent.save(os.path.join(self.save_dir, 'best.pt'))
-                print(f"   🏆 NEW BEST: {val_pnl:+.2f}%")
+                print(f"   🏆 NEW BEST: {val_pnl:+.2f}% (gen {gen}, {val_trades} trades)")
         
         self.agent.save(os.path.join(self.save_dir, 'final.pt'))
-        print(f"\n✅ Done! Best val PnL: {self.best_fitness:+.2f}%")
+        with open(self.metrics_path, 'w') as f:
+            json.dump(self.metrics, f, indent=2)
+        print(f"\n✅ Done! Best val PnL: {self.best_val_pnl:+.2f}% (gen {self.best_val_gen})")
         log_file.close()
     
     def _validate(self):
-        import torch
         symbol = 'XAUUSD'
         
         env = MultiSymbolEnvV4(self.data_dict, lookback=48, curriculum_episode=9999)
@@ -133,9 +144,9 @@ class ESTrainer:
         lstm_hidden = None
         
         for _ in range(500):
-            if env.current_step >= len(env.df) - 1: break
+            if env.current_step >= len(env.df) - 1:
+                break
             with torch.no_grad():
-                import torch
                 obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.agent.device)
                 logits, lstm_hidden = policy(obs_t, lstm_hidden)
                 mask = env.get_action_mask()
@@ -143,7 +154,8 @@ class ESTrainer:
                 logits_masked = logits.masked_fill(~mask_t, float('-inf'))
                 action = logits_masked.argmax(dim=-1).item()
             obs, _, done, _ = env.step(action)
-            if done: break
+            if done:
+                break
         
         pnl = (env.balance - FTMO_CONFIG['account_size']) / FTMO_CONFIG['account_size'] * 100
         wr = env.winning_trades / max(1, env.total_trades) * 100
@@ -151,6 +163,6 @@ class ESTrainer:
 
 
 if __name__ == "__main__":
-    trainer = ESTrainer(n_generations=500, pop_size=8, eval_steps=1000,
-                        hidden_dim=128, sigma=0.03, lr=0.02)
+    trainer = ESTrainer(n_generations=500, pop_size=16, eval_steps=2000,
+                        hidden_dim=128, sigma=0.015, lr=0.01)
     trainer.run()

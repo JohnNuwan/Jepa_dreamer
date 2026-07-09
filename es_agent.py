@@ -1,7 +1,7 @@
 """
 es_agent.py — Evolution Strategies pour trading FTMO.
 Population d'agents LSTM évalués en parallèle, sélection naturelle sur le PnL.
-Pas de critic, pas de value function, pas de reward shaping — juste le PnL.
+V2: antithetic sampling, pénalité zéro-trade, évaluation déterministe.
 """
 import torch
 import torch.nn as nn
@@ -45,10 +45,10 @@ class ESPolicy(nn.Module):
 
 
 class ESAgent:
-    """Evolution Strategies: population-based optimization of PnL."""
+    """Evolution Strategies V2: antithetic sampling + pénalité zéro-trade."""
     
     def __init__(self, input_dim=296, hidden_dim=128, action_dim=8,
-                 pop_size=16, sigma=0.02, lr=0.01, elite_frac=0.25, device='cuda:0'):
+                 pop_size=16, sigma=0.015, lr=0.01, elite_frac=0.25, device='cuda:0'):
         self.device = torch.device(device)
         self.pop_size = pop_size
         self.sigma = sigma
@@ -60,7 +60,8 @@ class ESAgent:
         # Master policy
         self.master = ESPolicy(input_dim, hidden_dim, action_dim).to(self.device)
         n_params = self.master.count_params()
-        print(f"ES Agent: {n_params:,} params | pop={pop_size} | σ={sigma} | GPU: {device}")
+        print(f"ES Agent V2: {n_params:,} params | pop={pop_size} | σ={sigma} | lr={lr} | GPU: {device}")
+        print(f"   Antithetic sampling: ON | Zero-trade penalty: ON")
         
         # Population: list of (perturbed copy, noise_vector)
         self.population = []
@@ -91,11 +92,11 @@ class ESAgent:
             p.data.copy_(flat[offset:offset + n].view_as(p))
             offset += n
     
-    def evaluate_single(self, policy, env, steps=1000) -> float:
-        """Évalue une politique, retourne le REWARD TOTAL (pas le PnL pur).
-        Le reward dense inclut time-decay, opening bonus, holding bonus."""
+    def evaluate_single(self, policy, env, steps=1000) -> tuple:
+        """Évalue une politique DÉTERMINISTE (argmax), retourne (reward_total, num_trades)."""
         obs = env.reset()
         total_reward = 0.0
+        num_trades = 0
         lstm_hidden = None
         
         for _ in range(steps):
@@ -105,28 +106,78 @@ class ESAgent:
                 mask = env.get_action_mask()
                 mask_t = torch.BoolTensor(mask).unsqueeze(0).to(self.device)
                 logits_masked = logits.masked_fill(~mask_t, float('-inf'))
-                probs = F.softmax(logits_masked, dim=-1)
-                if np.random.random() < 0.3:
-                    valid = np.where(mask)[0]
-                    action = np.random.choice(valid) if len(valid) > 0 else 0
-                else:
-                    action = probs.argmax(dim=-1).item()
+                # DÉTERMINISTE: toujours argmax, pas d'exploration aléatoire
+                action = logits_masked.argmax(dim=-1).item()
             
             obs, reward, done, _ = env.step(action)
             total_reward += reward
+            
+            # Compter les trades (BUY, SELL, SPLIT_BUY, SPLIT_SELL)
+            if action in (1, 2, 4, 5):
+                num_trades += 1
+            
             if done:
                 break
         
-        return float(total_reward)
+        return float(total_reward), num_trades
     
-    def evaluate_population(self, envs: List, steps=500) -> List[float]:
-        """Évalue toute la population sur des environnements parallèles."""
-        assert len(envs) == self.pop_size, f"Need {self.pop_size} envs, got {len(envs)}"
-        fitness = []
-        for (policy, _), env in zip(self.population, envs):
-            fit = self.evaluate_single(policy, env, steps)
-            fitness.append(fit)
-        return fitness
+    def evaluate_population(self, envs: List, steps=500) -> tuple:
+        """Évalue toute la population avec antithetic sampling.
+        
+        Pour chaque vecteur de bruit ε, on évalue :
+        - master + ε  (fitness positive)
+        - master - ε  (fitness négative, avec une copie anti-perturbée)
+        
+        fitness_effective[i] = (fitness(master+ε) - fitness(master-ε)) × signe_arbitraire
+        Ça donne un gradient 2× plus précis (antithetic variates).
+        
+        PENALITÉ: si une politique fait 0 trades, fitness -= 100.0
+        """
+        master_vec = self._get_params_flat(self.master)
+        
+        fitness_plus = []
+        fitness_minus = []
+        
+        for i, ((policy_plus, noise), env) in enumerate(zip(self.population, envs)):
+            # Évaluer master + noise (déjà créé dans population)
+            fit_p, trades_p = self.evaluate_single(policy_plus, env, steps)
+            
+            # Créer master - noise pour évaluation antithetic
+            anti_policy = ESPolicy(
+                self.master.lstm.input_size,
+                self.master.lstm.hidden_size,
+                self.action_dim,
+                self.master.lstm.num_layers
+            ).to(self.device)
+            self._set_params_flat(anti_policy, master_vec - noise)
+            
+            # Créer un env séparé pour l'anti-évaluation
+            from environment import MultiSymbolEnvV4
+            anti_env = MultiSymbolEnvV4(
+                env.data_dict, lookback=env.lookback, 
+                curriculum_episode=env.curriculum_episode
+            )
+            
+            fit_m, trades_m = self.evaluate_single(anti_policy, anti_env, steps)
+            
+            # Pénalité zéro-trade des deux côtés
+            ZERO_TRADE_PENALTY = 100.0
+            if trades_p == 0:
+                fit_p -= ZERO_TRADE_PENALTY
+            if trades_m == 0:
+                fit_m -= ZERO_TRADE_PENALTY
+            
+            fitness_plus.append(fit_p)
+            fitness_minus.append(fit_m)
+        
+        # Fitness effective = différence (le gradient pointe vers +ε si fit_plus > fit_minus)
+        effective_fitness = [p - m for p, m in zip(fitness_plus, fitness_minus)]
+        
+        # DEBUG: afficher stats
+        trades_plus = sum(1 for f in fitness_plus if f > -50)  # approx: pas pénalisé
+        trades_minus = sum(1 for f in fitness_minus if f > -50)
+        
+        return effective_fitness, fitness_plus, fitness_minus
     
     def evolve(self, fitness: List[float]):
         """Met à jour le master via sélection naturelle."""
@@ -139,14 +190,16 @@ class ESAgent:
         
         # Weighted average of elite noises
         elite_fitness = [f for f, _ in [x[1] for x in elite]]
-        total_fit = sum(max(0, f) for f in elite_fitness) + 1e-8
-        weights = [max(0, f) / total_fit for f in elite_fitness]
+        # Utiliser softmax des rangs pour les poids (plus robuste que fitness brute)
+        ranks = np.arange(len(elite_fitness), 0, -1)  # [n_elite, n_elite-1, ..., 1]
+        total_rank = sum(ranks)
+        weights = ranks / total_rank
         
         # Compute gradient estimate
         master_vec = self._get_params_flat(self.master)
         grad = torch.zeros_like(master_vec)
         for (idx, (fit, (_, noise))), w in zip(elite, weights):
-            grad += w * noise
+            grad += w * noise * np.sign(fit)  # signe: direction du gradient
         
         # Update master
         master_vec += self.lr * grad
