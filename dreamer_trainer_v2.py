@@ -210,13 +210,11 @@ class DreamerV3AgentV2:
         kl_prior = torch.distributions.kl_divergence(prior_dist, post_dist).mean()  # prior → post
         kl_loss = 0.8 * kl_post + 0.2 * kl_prior  # FIX: KL balancing
         
-        wm_loss = reward_loss + 0.1 * kl_loss  # V4.3: prior+posterior reward loss
-        
-        # V4.3: warm-up — train RSSM sans reward_head au début
-        # pour que les états latents soient informatifs avant de prédire le reward
+        wm_loss = reward_loss + 0.5 * kl_loss  # V4.3: prior+posterior reward loss
+        # V4.3: warm-up — train RSSM plus fort sur KL pour utiliser les observations
         if self.episode < self.rwd_warmup:
-            wm_loss = 0.1 * kl_loss  # RSSM-only
-            reward_loss = torch.tensor(0.0, device=self.device_wm)
+            wm_loss = 2.0 * kl_loss  # RSSM-only avec KL renforcé
+            reward_loss = torch.tensor(0.0, device=self.device_wm)  # pas de reward_head
         
         self.wm_opt.zero_grad()
         wm_loss.backward()
