@@ -38,3 +38,4 @@ Thumbs.db
 # Config with potential secrets
 .env
 *.env
+*.pt
