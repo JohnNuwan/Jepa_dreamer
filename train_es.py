@@ -51,7 +51,7 @@ class ESTrainer:
         
         self.agent = ESAgent(input_dim=self.n_features, hidden_dim=hidden_dim,
                              action_dim=N_ACTIONS, pop_size=pop_size, sigma=sigma,
-                             lr=lr, elite_frac=0.25, device='cuda:0')
+                             lr=lr, elite_frac=0.25, devices=('cuda:0', 'cuda:1'))
         
         self.best_val_pnl = -float('inf')
         self.best_val_gen = 0
@@ -65,9 +65,9 @@ class ESTrainer:
     
     def run(self):
         log_file = open(self.log_path, 'w')
-        print(f"\n=== ES Training V2 ({self.n_generations} gens, pop={self.pop_size}) ===")
+        print(f"\n=== ES Training V4 ({self.n_generations} gens, pop={self.pop_size}) ===")
         print(f"   {self.eval_steps} steps/eval, σ={self.agent.sigma}, lr={self.agent.lr}")
-        print(f"   Antithetic: ON | Zero-trade penalty: -100 | Déterministe: ON")
+        print(f"   Stochastique temp={self.agent.temp_start}→{self.agent.temp_end} | Dual GPU")
         print()
         
         for gen in range(self.n_generations):
@@ -147,10 +147,10 @@ class ESTrainer:
             if env.current_step >= len(env.df) - 1:
                 break
             with torch.no_grad():
-                obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.agent.device)
+                obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.agent.primary_device)
                 logits, lstm_hidden = policy(obs_t, lstm_hidden)
                 mask = env.get_action_mask()
-                mask_t = torch.BoolTensor(mask).unsqueeze(0).to(self.agent.device)
+                mask_t = torch.BoolTensor(mask).unsqueeze(0).to(self.agent.primary_device)
                 logits_masked = logits.masked_fill(~mask_t, float('-inf'))
                 action = logits_masked.argmax(dim=-1).item()
             obs, _, done, _ = env.step(action)
@@ -163,6 +163,6 @@ class ESTrainer:
 
 
 if __name__ == "__main__":
-    trainer = ESTrainer(n_generations=500, pop_size=16, eval_steps=2000,
-                        hidden_dim=128, sigma=0.015, lr=0.01)
+    trainer = ESTrainer(n_generations=200, pop_size=16, eval_steps=1000,
+                        hidden_dim=128, sigma=0.02, lr=0.1)
     trainer.run()
