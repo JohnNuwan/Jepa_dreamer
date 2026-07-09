@@ -99,7 +99,7 @@ class V4Trainer:
         self.agent.temperature = 2.0  # V4 fix: start hot for exploration
 
         self.data_dict = data_dict
-        self.replay = ReplayBuffer(capacity=1000000)  # 1M transitions
+        self.replay = ReplayBuffer(capacity=4000000)  # V5: 4M transitions (~1.2 GB RAM)
         self.best_val_pnl = -999
         self.log_path = os.path.join(save_dir, 'training_v4.log')
         self.metrics_path = os.path.join(save_dir, 'metrics.json')
@@ -122,16 +122,13 @@ class V4Trainer:
             wm_losses.append(result['wm_loss'])
             jepa_losses.append(result['jepa_loss'])
 
-        # AC: 4 steps per call, batch 512 (skip during RSSM warm-up)
+        # AC: 4 steps per call, batch 512
         ac_losses, entropies = [], []
-        if self.agent.episode >= self.agent.rwd_warmup:
-            for _ in range(4):
-                batch = self.replay.sample(512)
-                result = self.agent.train_actor_critic(batch)
-                ac_losses.append(result['ac_loss'])
-                entropies.append(result.get('entropy', 0))
-        else:
-            ac_losses, entropies = [0.0], [2.079]  # dummy values
+        for _ in range(4):
+            batch = self.replay.sample(512)
+            result = self.agent.train_actor_critic(batch)
+            ac_losses.append(result['ac_loss'])
+            entropies.append(result.get('entropy', 0))
 
         metrics.update({
             'wm_loss': np.mean(wm_losses),
@@ -217,9 +214,6 @@ class V4Trainer:
 
             # Environment
             env = MultiSymbolEnvV4(self.data_dict, lookback=48, curriculum_episode=ep)
-
-            # V4.3: sync episode for RSSM warm-up
-            self.agent.episode = ep
 
             # Collect
             ep_reward, ep_steps, info = self._collect_episode(self.agent, env)

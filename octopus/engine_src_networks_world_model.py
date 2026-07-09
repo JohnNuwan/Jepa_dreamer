@@ -261,14 +261,19 @@ class RSSMWorldModel(nn.Module):
             embedding_dim=embedding_dim
         )
         
-        # Prédicteur de récompense (avec symlog pour stabilité)
+        # Prédicteur de récompense V5: action en input (3x2048)
+        rwd_in_dim = stoch_size * stoch_classes + deter_size + action_dim
+        self.rwd_in_dim = rwd_in_dim
         self.reward_head = nn.Sequential(
-            nn.Linear(stoch_size * stoch_classes + deter_size, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(rwd_in_dim, 2048),
+            nn.LayerNorm(2048),
             nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(2048, 2048),
+            nn.LayerNorm(2048),
             nn.GELU(),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(2048, 1024),
+            nn.GELU(),
+            nn.Linear(1024, 1)
         )
         
         # Prédicteur de continuation (fin d'épisode)
@@ -284,20 +289,28 @@ class RSSMWorldModel(nn.Module):
     def predict_reward(
         self,
         stoch: torch.Tensor,
-        deter: torch.Tensor
+        deter: torch.Tensor,
+        action: torch.Tensor = None
     ) -> torch.Tensor:
         """Prédit la récompense d'un état latent.
         
         Args:
             stoch: État stochastique (batch, stoch, classes).
             deter: État déterministe (batch, deter).
+            action: Action one-hot (batch, action_dim). Si None, prédit sans action.
             
         Returns:
             Récompense prédite en espace symlog.
         """
-        x = torch.cat([
-            stoch.reshape(stoch.shape[0], -1), deter
-        ], dim=-1)
+        if action is None:
+            x = torch.cat([stoch.reshape(stoch.shape[0], -1), deter,
+                           torch.zeros(stoch.shape[0], self.rwd_in_dim - stoch.shape[-1]*stoch.shape[-2] - deter.shape[-1], device=stoch.device)], dim=-1)
+        else:
+            x = torch.cat([stoch.reshape(stoch.shape[0], -1), deter, action], dim=-1)
+        # V5: move to reward_head device (GPU1) if needed
+        rwd_device = next(self.reward_head.parameters()).device
+        if x.device != rwd_device:
+            x = x.to(rwd_device)
         return self.reward_head(x)
     
     def predict_continue(
@@ -441,8 +454,8 @@ class RSSMWorldModel(nn.Module):
             stoch_traj.append(stoch)
             deter_traj.append(deter)
             
-            # Prédire récompense et continuation
-            reward = self.predict_reward(stoch, deter)
+            # Prédire récompense (avec action pour V5) et continuation
+            reward = self.predict_reward(stoch, deter, action)
             cont = self.predict_continue(stoch, deter)
             
             reward_traj.append(reward)

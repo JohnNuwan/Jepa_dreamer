@@ -73,6 +73,9 @@ class DreamerV3AgentV2:
             action_dim=action_dim, embedding_dim=embedding_dim
         ).to(self.device_wm)
         
+        # V5: Déplacer le reward_head sur GPU1 (plus de capacité 3×2048)
+        self.world_model.reward_head = self.world_model.reward_head.to(self.device_ac)
+        
         # FIX: Separate optimizers with different LRs
         self.jepa_opt = torch.optim.AdamW(self.jepa.parameters(), lr=jepa_lr, weight_decay=0.01)
         self.wm_opt = torch.optim.AdamW(self.world_model.parameters(), lr=wm_lr, weight_decay=0.01)
@@ -112,10 +115,6 @@ class DreamerV3AgentV2:
         self.min_entropy = 0.5  # nat floor
         self.base_entropy_coeff = entropy_coeff
         self.temperature = 1.0  # V4: global temperature for action sampling
-        
-        # V4.3: warm-up counter — delay reward_head training until RSSM is ready
-        self.episode = 0
-        self.rwd_warmup = 80  # episodes of RSSM-only training
         
         n_params = (sum(p.numel() for p in self.jepa.parameters()) +
                     sum(p.numel() for p in self.world_model.parameters()) +
@@ -180,21 +179,21 @@ class DreamerV3AgentV2:
             prev_embedding=embeddings, next_embedding=next_embeddings
         )
         
-        pred_reward = self.world_model.predict_reward(post, deter_next)
+        pred_reward = self.world_model.predict_reward(post, deter_next, action_t)
         target_reward = symlog(rewards.view(-1, 1))
         
-        # FIX DÉFINITIF V4.3: entraîner le reward_head sur les états PRIOR
-        # (ceux utilisés pendant l'imagination), pas seulement POSTERIOR.
-        # Le prior n'a pas d'observation → le reward_head apprend à prédire
-        # sans info observationnelle → fonctionne dans les rêves.
-        posterior_loss = F.mse_loss(pred_reward.squeeze(-1), target_reward.squeeze(-1))
+        # V5: compute reward loss on GPU1 (where reward_head lives)
+        rwd_dev = next(self.world_model.reward_head.parameters()).device
+        target_rwd = target_reward.to(rwd_dev)
+        
+        posterior_loss = F.mse_loss(pred_reward.squeeze(-1), target_rwd.squeeze(-1))
         
         # Prédiction sur l'état PRIOR (sans observation)
-        pred_reward_prior = self.world_model.predict_reward(prior, deter_next)
-        prior_loss = F.mse_loss(pred_reward_prior.squeeze(-1), target_reward.squeeze(-1))
+        pred_reward_prior = self.world_model.predict_reward(prior, deter_next, action_t)
+        prior_loss = F.mse_loss(pred_reward_prior.squeeze(-1), target_rwd.squeeze(-1))
         
-        # Loss combinée: posterior (pour stabilité) + prior (pour imagination)
-        reward_loss = (posterior_loss + prior_loss) / 2.0
+        # Combiner et ramener sur GPU0 pour la loss totale
+        reward_loss = ((posterior_loss + prior_loss) / 2.0).to(self.device_wm)
         
         # FIX: KL balancing (DreamerV3 style): 80% posterior, 20% prior
         post_logits = self.world_model.transition.posterior_net(
@@ -210,11 +209,7 @@ class DreamerV3AgentV2:
         kl_prior = torch.distributions.kl_divergence(prior_dist, post_dist).mean()  # prior → post
         kl_loss = 0.8 * kl_post + 0.2 * kl_prior  # FIX: KL balancing
         
-        wm_loss = reward_loss + 0.5 * kl_loss  # V4.3: prior+posterior reward loss
-        # V4.3: warm-up — train RSSM plus fort sur KL pour utiliser les observations
-        if self.episode < self.rwd_warmup:
-            wm_loss = 2.0 * kl_loss  # RSSM-only avec KL renforcé
-            reward_loss = torch.tensor(0.0, device=self.device_wm)  # pas de reward_head
+        wm_loss = reward_loss + 0.1 * kl_loss  # V4.3: prior+posterior reward head, no warmup
         
         self.wm_opt.zero_grad()
         wm_loss.backward()
@@ -339,10 +334,15 @@ class DreamerV3AgentV2:
         print(f"Saved: {path}")
     
     def load(self, path):
-        ckpt = torch.load(path, map_location=self.device_wm)
+        ckpt = torch.load(path, map_location='cpu')
         self.jepa.load_state_dict(ckpt['jepa'])
+        self.jepa.to(self.device_wm)
         self.world_model.load_state_dict(ckpt['world_model'])
+        self.world_model.to(self.device_wm)
+        # V5: reward_head must be on GPU1
+        self.world_model.reward_head = self.world_model.reward_head.to(self.device_ac)
         self.actor_critic.load_state_dict(ckpt['actor_critic'])
+        self.actor_critic.to(self.device_ac)
         print(f"Loaded: {path}")
 
 
