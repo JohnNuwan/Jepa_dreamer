@@ -122,13 +122,16 @@ class V4Trainer:
             wm_losses.append(result['wm_loss'])
             jepa_losses.append(result['jepa_loss'])
 
-        # AC: 4 steps per call, batch 512 (V4.2: +samples for better policy)
+        # AC: 4 steps per call, batch 512 (skip during RSSM warm-up)
         ac_losses, entropies = [], []
-        for _ in range(4):
-            batch = self.replay.sample(512)
-            result = self.agent.train_actor_critic(batch)
-            ac_losses.append(result['ac_loss'])
-            entropies.append(result.get('entropy', 0))
+        if self.agent.episode >= self.agent.rwd_warmup:
+            for _ in range(4):
+                batch = self.replay.sample(512)
+                result = self.agent.train_actor_critic(batch)
+                ac_losses.append(result['ac_loss'])
+                entropies.append(result.get('entropy', 0))
+        else:
+            ac_losses, entropies = [0.0], [2.079]  # dummy values
 
         metrics.update({
             'wm_loss': np.mean(wm_losses),
