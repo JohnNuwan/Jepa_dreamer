@@ -224,9 +224,90 @@ def test_ppo():
         return False
 
 
+def test_sell():
+    print("\n=== Test ES sur marché baissier (trending down) ===")
+    class FallingEnv(TrendingEnv):
+        def step(self, action):
+            self.step_count += 1
+            old_unrealized = 0.0
+            if self.position is not None:
+                direction, entry = self.position
+                old_unrealized = direction * (self.price - entry) / entry * 100
+            # Price goes DOWN
+            self.price *= 0.999 + np.random.randn() * 0.0005
+            self.price = max(0.01, self.price)
+            new_unrealized = 0.0
+            if self.position is not None:
+                direction, entry = self.position
+                new_unrealized = direction * (self.price - entry) / entry * 100
+            reward = new_unrealized - old_unrealized
+            
+            if action == BUY and self.position is None:
+                self.position = (1, self.price); self._last_open = self.step_count
+            elif action == SELL and self.position is None:
+                self.position = (-1, self.price); self._last_open = self.step_count
+            elif action == CLOSE and self.position is not None:
+                direction, entry = self.position
+                pnl = direction * (self.price - entry) * 100
+                self.balance += pnl
+                self.total_trades += 1
+                if pnl > 0: self.winning_trades += 1
+                reward += pnl / FTMO_CONFIG['account_size'] * 100
+                self.position = None; self._last_open = 0
+            
+            if self.position is not None and self.step_count - self._last_open > 50:
+                self._simulate_close()
+            if self.step_count > 500: self.done = True
+            
+            obs = np.zeros((self.lookback, 296), dtype=np.float32)
+            obs[:, 0] = np.linspace(self.price - self.lookback * 0.05, self.price, self.lookback)
+            if self.position is not None:
+                obs[:, 1] = self.position[0] * (self.price - self.position[1]) / self.position[1]
+                obs[:, 2] = self.position[0]
+            return obs, reward, self.done, {}
+    
+    agent = ESAgent(input_dim=296, hidden_dim=64, action_dim=N_ACTIONS,
+                    pop_size=8, sigma=0.03, lr=0.02, device='cuda:0')
+    for gen in range(30):
+        envs = [FallingEnv() for _ in range(agent.pop_size)]
+        fitness = agent.evaluate_population(envs, steps=200)
+        agent.evolve(fitness)
+        if gen % 5 == 0:
+            print(f"  Gen {gen:>3d}: best={max(fitness):+.2f}%")
+    
+    env = FallingEnv()
+    policy = agent.get_best_policy()
+    obs = env.reset()
+    lstm_hidden = None
+    trades = []
+    for _ in range(200):
+        with torch.no_grad():
+            obs_t = torch.FloatTensor(obs).unsqueeze(0).to(agent.device)
+            logits, lstm_hidden = policy(obs_t, lstm_hidden)
+            action = logits.argmax(dim=-1).item()
+        obs, _, done, _ = env.step(action)
+        trades.append(action)
+        if done: break
+    
+    n_buy = trades.count(BUY)
+    n_sell = trades.count(SELL)
+    n_hold = trades.count(HOLD)
+    pnl = (env.balance - FTMO_CONFIG['account_size']) / FTMO_CONFIG['account_size'] * 100
+    print(f"  Résultat: PnL={pnl:+.2f}% | BUY={n_buy} SELL={n_sell} HOLD={n_hold}")
+    print(f"  Trades: {env.total_trades} | Win: {env.winning_trades}")
+    if n_sell > n_buy + n_hold:
+        print("  ✅ L'agent a appris SELL !")
+        return True
+    else:
+        print(f"  ❌ L'agent n'a pas appris SELL")
+        return False
+
+
 if __name__ == "__main__":
     es_ok = test_es()
+    sell_ok = test_sell()
     ppo_ok = test_ppo()
     print(f"\n=== BILAN ===")
-    print(f"  ES  : {'✅ Fonctionne' if es_ok else '❌ Cassé'}")
-    print(f"  PPO : {'✅ Fonctionne' if ppo_ok else '⚠️  Problème'}")
+    print(f"  ES BUY : {'✅' if es_ok else '❌'}")
+    print(f"  ES SELL: {'✅' if sell_ok else '❌'}")
+    print(f"  PPO    : {'✅' if ppo_ok else '⚠️'}")
