@@ -94,7 +94,7 @@ class V4Trainer:
             input_dim=n_features, seq_len=48, embedding_dim=128,
             stoch_size=32, stoch_classes=32, deter_size=512,
             hidden_dim=512, action_dim=N_ACTIONS,
-            horizon=30, gamma=0.997, lambda_=0.95, entropy_coeff=0.01
+            horizon=15, gamma=0.997, lambda_=0.95, entropy_coeff=0.01
         )
         self.agent.temperature = 2.0  # V4 fix: start hot for exploration
 
@@ -122,9 +122,9 @@ class V4Trainer:
             wm_losses.append(result['wm_loss'])
             jepa_losses.append(result['jepa_loss'])
 
-        # AC: 4 steps per call, batch 512
+        # AC: 16 steps per call, batch 512 (V5: plus d'échantillons + horizon réduit)
         ac_losses, entropies = [], []
-        for _ in range(4):
+        for _ in range(16):
             batch = self.replay.sample(512)
             result = self.agent.train_actor_critic(batch)
             ac_losses.append(result['ac_loss'])
@@ -312,5 +312,5 @@ class V4Trainer:
 
 
 if __name__ == "__main__":
-    trainer = V4Trainer(n_episodes=3000)
+    trainer = V4Trainer(n_episodes=500)
     trainer.run()
