@@ -219,7 +219,7 @@ class MultiSymbolEnvV4:
     def reset(self):
         self.current_symbol = np.random.choice(self.symbols)
         self.features, self.feature_names, self.df = self.data_dict[self.current_symbol]
-        self.spec = SYMBOLS[self.current_symbol]
+        self.spec = SYMBOLS[self.current_symbol]  # BUGFIX: reset() ne mettait pas à jour spec
 
         # Random start within data
         max_start = max(1, len(self.df) - self.lookback - 2000)

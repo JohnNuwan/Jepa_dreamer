@@ -140,13 +140,37 @@ class ESTrainer:
         env.features, env.feature_names, env.df = self.data_dict[symbol]
         env.spec = SYMBOLS[symbol]
         env.current_step = env.lookback + len(env.df) - 3000
-        env.reset()
+        # BUGFIX: NE PAS appeler reset() — il écrase current_symbol/current_step
+        # avec des valeurs aléatoires. On initialise l'état manuellement.
+        env.balance = FTMO_CONFIG['account_size']
+        env.peak_balance = env.balance
+        env.daily_start_balance = env.balance
+        env.prev_equity = env.balance
+        env.positions = []
+        env.trades_today = 0
+        env.consecutive_losses = 0
+        env.cooldown_until = 0
+        env.last_trade_day = -1
+        env.total_trades = 0
+        env.winning_trades = 0
+        env.buy_trades = 0
+        env.sell_trades = 0
+        env.episode_pnl = 0
+        env.realized_pnl = 0
+        env.bars_since_last_trade = 0
+        env.max_dd_exceeded = False
+        env.peak_equity = env.balance
+        env.episode_reward = 0.0
         obs = env._get_obs()
         
         policy = self.agent.get_best_policy()
         lstm_hidden = None
         
-        for _ in range(500):
+        # Log détaillé première étape pour diagnostic
+        actions_taken = {a: 0 for a in range(N_ACTIONS)}
+        first_logits = None
+        
+        for step_i in range(500):
             if env.current_step >= len(env.df) - 1:
                 break
             with torch.no_grad():
@@ -156,12 +180,30 @@ class ESTrainer:
                 mask_t = torch.BoolTensor(mask).unsqueeze(0).to(self.agent.primary_device)
                 logits_masked = logits.masked_fill(~mask_t, float('-inf'))
                 action = logits_masked.argmax(dim=-1).item()
+                
+                if first_logits is None:
+                    first_logits = logits_masked.cpu().numpy().flatten()
             obs, _, done, _ = env.step(action)
+            actions_taken[action] += 1
             if done:
                 break
         
         pnl = (env.balance - FTMO_CONFIG['account_size']) / FTMO_CONFIG['account_size'] * 100
         wr = env.winning_trades / max(1, env.total_trades) * 100
+        
+        # Log diagnostique
+        if env.total_trades == 0 and first_logits is not None:
+            # Afficher les logits masqués pour comprendre pourquoi HOLD gagne
+            top_actions = np.argsort(first_logits)[::-1][:4]
+            top_str = " | ".join(f"{ACTION_NAMES[a]}={first_logits[a]:+.2f}" 
+                                 for a in top_actions if not np.isinf(first_logits[a]))
+            val_mask = env.get_action_mask()
+            mask_names = [ACTION_NAMES[i] for i, m in enumerate(val_mask) if m]
+            print(f"   🔍 VALIDATION DEBUG: 0 trades | symbol={symbol} | "
+                  f"step_start={env.lookback + len(env.df) - 3000} | "
+                  f"top_logits={top_str} | "
+                  f"mask={mask_names}")
+        
         return pnl, env.total_trades, wr
 
 
