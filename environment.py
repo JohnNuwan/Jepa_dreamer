@@ -11,7 +11,7 @@ ftmo_agent/environment_v4.py — Environment V4 with ALL fixes:
 import numpy as np
 import pandas as pd
 from config import (SYMBOLS, SymbolSpec, ACTIVE_SYMBOLS, FTMO_CONFIG,
-                     RISK_CONFIG, ANTI_BIAS_CONFIG, CURRICULUM_CONFIG,
+                     RISK_CONFIG, ANTI_BIAS_CONFIG, CURRICULUM_CONFIG, CORRELATION_SYMBOLS,
                      HOLD, BUY, SELL, CLOSE, SPLIT_BUY, SPLIT_SELL,
                      PYRAMID, PARTIAL_CLOSE, N_ACTIONS, ACTION_NAMES)
 from features_v2 import (compute_multi_tf_features, get_symbol_embedding_v4,
@@ -108,15 +108,15 @@ class MultiSymbolEnvV4:
     def _get_curriculum_phase(self):
         """V4: Determine curriculum phase based on episode count."""
         if not CURRICULUM_CONFIG['enabled']:
-            return 3, CURRICULUM_CONFIG['phase3_spread_mult']
+            return 3, CURRICULUM_CONFIG['phase3_spread_mult'], 0.0
         cfg = CURRICULUM_CONFIG
         ep = self.curriculum_episode
         if ep < cfg['phase1_episodes']:
-            return 1, cfg['phase1_spread_mult']
+            return 1, cfg['phase1_spread_mult'], cfg.get('phase1_exploration_bonus', 0.005)
         elif ep < cfg['phase1_episodes'] + cfg['phase2_episodes']:
-            return 2, cfg['phase2_spread_mult']
+            return 2, cfg['phase2_spread_mult'], cfg.get('phase2_exploration_bonus', 0.001)
         else:
-            return 3, cfg['phase3_spread_mult']
+            return 3, cfg['phase3_spread_mult'], 0.0
 
     def _get_spread(self):
         """
@@ -127,7 +127,7 @@ class MultiSymbolEnvV4:
         - Random component for realism
         """
         spec = self.spec
-        phase, mult = self._get_curriculum_phase()
+        phase, mult, _ = self._get_curriculum_phase()
 
         base = spec.spread_points_mean * spec.pip_size
         base_std = spec.spread_points_std * spec.pip_size
@@ -185,7 +185,7 @@ class MultiSymbolEnvV4:
         V4: Slippage proportional to spread and volatility.
         Returns slippage in price units.
         """
-        phase, mult = self._get_curriculum_phase()
+        phase, mult, _ = self._get_curriculum_phase()
         if phase == 1:
             return 0.0
 
@@ -208,7 +208,7 @@ class MultiSymbolEnvV4:
 
     def _get_commission(self, lots):
         """V4: Commission per trade."""
-        phase, mult = self._get_curriculum_phase()
+        phase, mult, _ = self._get_curriculum_phase()
         if phase == 1:
             return 0.0
         cfg = CURRICULUM_CONFIG
@@ -341,7 +341,7 @@ class MultiSymbolEnvV4:
     def get_action_mask(self):
         mask = np.zeros(N_ACTIONS, dtype=bool)
         has_position = len(self.positions) > 0
-        phase, _ = self._get_curriculum_phase()
+        phase, _, _ = self._get_curriculum_phase()
         max_trades = CURRICULUM_CONFIG[f'phase{phase}_max_trades']
         can_open = (self.trades_today < max_trades and
                     self.current_step >= self.cooldown_until and
@@ -394,29 +394,34 @@ class MultiSymbolEnvV4:
         # ── 2. Execute action ──
         spread = self._get_spread()
         slippage = self._get_slippage()
-        phase, _ = self._get_curriculum_phase()
+        phase, _, _ = self._get_curriculum_phase()
         max_trades = CURRICULUM_CONFIG[f'phase{phase}_max_trades']
         can_trade = (self.trades_today < max_trades and
                      self.current_step >= self.cooldown_until and
                      len(self.positions) < FTMO_CONFIG['max_concurrent_positions'])
 
         traded_this_step = False
+        opened_position = False
         if action == BUY and not self.positions and can_trade:
             entry = current_price + spread / 2
             reward += self._open_position(1, entry, 'full')
             traded_this_step = True
+            opened_position = True
         elif action == SELL and not self.positions and can_trade:
             entry = current_price - spread / 2
             reward += self._open_position(-1, entry, 'full')
             traded_this_step = True
+            opened_position = True
         elif action == SPLIT_BUY and not self.positions and can_trade:
             entry = current_price + spread / 2
             reward += self._open_position(1, entry, 'split_1', split=True)
             traded_this_step = True
+            opened_position = True
         elif action == SPLIT_SELL and not self.positions and can_trade:
             entry = current_price - spread / 2
             reward += self._open_position(-1, entry, 'split_1', split=True)
             traded_this_step = True
+            opened_position = True
         elif action == CLOSE and self.positions:
             for i in range(len(self.positions) - 1, -1, -1):
                 reward += self._close_position(i, current_price, 'MODEL')
@@ -441,13 +446,41 @@ class MultiSymbolEnvV4:
                 reward += pnl / max(1, FTMO_CONFIG['account_size'])
                 traded_this_step = True
 
-        # ── 3. Pure PnL reward ── V4: NO shaping, just equity change
+        # ── 3. DENSE REWARD SHAPING ──
+        #    Principe : 100% des steps reçoivent un reward non-nul
+        #    pour que le WM apprenne une fonction reward non-triviale.
+        phase, _, exp_bonus = self._get_curriculum_phase()
+        cfg = CURRICULUM_CONFIG
+
+        # 3a. Current equity
         current_equity = self.balance + sum(
             p.unrealized_pnl(current_price) for p in self.positions
         )
         equity_change = (current_equity - self.prev_equity) / FTMO_CONFIG['account_size']
-        reward += equity_change  # Pure PnL % — this is THE core reward
         self.prev_equity = current_equity
+
+        # 3b. Scaled PnL (×100 phase 1 pour que le WM le voie)
+        pnl_scale = cfg.get(f'phase{phase}_pnl_scale', 1.0)
+        reward += equity_change * pnl_scale
+
+        # 3c. Time-decay : plus l'agent reste sans trade, plus il paie
+        self.bars_since_last_trade += 1
+        decay = -0.02 * (self.bars_since_last_trade / 48.0)
+        decay = max(-0.02, decay)  # clamp at -2%/step
+        reward += decay
+
+        # 3d. Holding bonus : +0.005/step si position ouverte
+        if self.positions:
+            reward += 0.005
+
+        # 3e. Opening bonus + reset time-decay
+        if opened_position:
+            reward += exp_bonus  # phase 1 = 0.20
+            self.bars_since_last_trade = 0
+
+        # 3f. Close resets counter too
+        if action == CLOSE and self.positions:
+            self.bars_since_last_trade = 0
 
         # Track peak equity
         if current_equity > self.peak_equity:
@@ -588,7 +621,14 @@ class MultiSymbolEnvV4:
                 self.cooldown_until = self.current_step + FTMO_CONFIG['cooldown_bars']
 
         self.positions.pop(idx)
-        return pnl_norm  # Pure normalized PnL
+
+        # Trade completion bonus/penalty for better reward signal
+        if pnl > 0:
+            reward_extra = CURRICULUM_CONFIG.get('trade_completion_bonus', 0.01)
+        else:
+            reward_extra = -CURRICULUM_CONFIG.get('trade_completion_penalty', 0.01)
+
+        return pnl_norm + reward_extra
 
     def _partial_close(self, pos, close_lots, exit_price):
         pnl_per_unit = pos.unrealized_pnl(exit_price) / max(1, pos.lots)

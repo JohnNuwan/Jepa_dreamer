@@ -105,17 +105,26 @@ CURRICULUM_CONFIG = {
     "phase1_slippage_mult": 0.0,   # no slippage
     "phase1_commission_mult": 0.0, # no commission
     "phase1_max_trades": 20,       # lots of attempts
+    "phase1_exploration_bonus": 0.20,  # 20% bonus for opening trades
+    "phase1_pnl_scale": 100.0,         # amplify PnL ×100 in phase 1
     # Phase 2: low frictions (200-500 episodes)
     "phase2_episodes": 300,
     "phase2_spread_mult": 0.3,     # 30% of real spread
     "phase2_slippage_mult": 0.3,
     "phase2_commission_mult": 0.0,
     "phase2_max_trades": 12,
+    "phase2_exploration_bonus": 0.01,  # was 0.005, doublé
+    "phase2_pnl_scale": 10.0,          # scaling réduit
     # Phase 3: full frictions (500+ episodes)
     "phase3_spread_mult": 1.0,
     "phase3_slippage_mult": 1.0,
     "phase3_commission_mult": 1.0,
     "phase3_max_trades": 8,
+    # Global reward shaping
+    "trade_completion_bonus": 0.01,    # +1% du compte pour trade fermé en profit
+    "trade_completion_penalty": 0.01,  # -1% pour trade fermé en perte
+    "time_decay_max": 0.02,            # -2%/step max d'inactivité
+    "holding_bonus": 0.005,            # +0.5%/step en position
 }
 
 # Cross-symbol correlation window (bars)

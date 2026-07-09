@@ -111,6 +111,11 @@ class DreamerV3AgentV2:
         self.entropy_history = deque(maxlen=50)
         self.min_entropy = 0.5  # nat floor
         self.base_entropy_coeff = entropy_coeff
+        self.temperature = 1.0  # V4: global temperature for action sampling
+        
+        # V4.3: warm-up counter — delay reward_head training until RSSM is ready
+        self.episode = 0
+        self.rwd_warmup = 80  # episodes of RSSM-only training
         
         n_params = (sum(p.numel() for p in self.jepa.parameters()) +
                     sum(p.numel() for p in self.world_model.parameters()) +
@@ -125,10 +130,29 @@ class DreamerV3AgentV2:
         actions = torch.FloatTensor(batch['actions']).to(self.device_wm)
         rewards = torch.FloatTensor(batch['rewards']).to(self.device_wm)
         next_obs = torch.FloatTensor(batch['next_obs']).to(self.device_wm)
-        
+
+        # Debug shapes
+        if obs.dim() == 2 and obs.shape[-1] == obs.shape[-2]:
+            # Obs is flat (B, H*W) instead of (B, H, W)
+            B = obs.shape[0]
+            S = 48
+            D = obs.shape[1] // S
+            obs = obs.view(B, S, D)
+            next_obs = next_obs.view(B, S, D)
+        elif obs.dim() == 2 and obs.shape[-1] != obs.shape[-2]:
+            # Could be (B*S, D) collapsed
+            B = int(obs.shape[0] ** 0.5)  # guess
+            S = obs.shape[0] // B
+            D = obs.shape[-1]
+            print(f"  ⚠️ Obs reshape: ({obs.shape[0]},{obs.shape[1]}) → ({B},{S},{D})")
+            obs = obs.view(B, S, D)
+            # Same for next_obs if same shape
+            if next_obs.dim() == 2 and next_obs.shape[0] == obs.shape[0] and next_obs.shape[1] == 296:
+                next_obs = next_obs.view(B, S, D)
+
         B = obs.shape[0]
-        
-        # === STEP 1: JEPA self-supervised (separate backward) ===
+        S = obs.shape[1]
+        D = obs.shape[2]
         z_online = self.jepa.encoder(obs)
         z_target = self.jepa.encode_target(next_obs)
         z_pred = self.jepa.predictor(z_online)
@@ -158,7 +182,19 @@ class DreamerV3AgentV2:
         
         pred_reward = self.world_model.predict_reward(post, deter_next)
         target_reward = symlog(rewards.view(-1, 1))
-        reward_loss = F.mse_loss(pred_reward.squeeze(-1), target_reward.squeeze(-1))
+        
+        # FIX DÉFINITIF V4.3: entraîner le reward_head sur les états PRIOR
+        # (ceux utilisés pendant l'imagination), pas seulement POSTERIOR.
+        # Le prior n'a pas d'observation → le reward_head apprend à prédire
+        # sans info observationnelle → fonctionne dans les rêves.
+        posterior_loss = F.mse_loss(pred_reward.squeeze(-1), target_reward.squeeze(-1))
+        
+        # Prédiction sur l'état PRIOR (sans observation)
+        pred_reward_prior = self.world_model.predict_reward(prior, deter_next)
+        prior_loss = F.mse_loss(pred_reward_prior.squeeze(-1), target_reward.squeeze(-1))
+        
+        # Loss combinée: posterior (pour stabilité) + prior (pour imagination)
+        reward_loss = (posterior_loss + prior_loss) / 2.0
         
         # FIX: KL balancing (DreamerV3 style): 80% posterior, 20% prior
         post_logits = self.world_model.transition.posterior_net(
@@ -174,7 +210,13 @@ class DreamerV3AgentV2:
         kl_prior = torch.distributions.kl_divergence(prior_dist, post_dist).mean()  # prior → post
         kl_loss = 0.8 * kl_post + 0.2 * kl_prior  # FIX: KL balancing
         
-        wm_loss = reward_loss + 0.1 * kl_loss
+        wm_loss = reward_loss + 0.1 * kl_loss  # V4.3: prior+posterior reward loss
+        
+        # V4.3: warm-up — train RSSM sans reward_head au début
+        # pour que les états latents soient informatifs avant de prédire le reward
+        if self.episode < self.rwd_warmup:
+            wm_loss = 0.1 * kl_loss  # RSSM-only
+            reward_loss = torch.tensor(0.0, device=self.device_wm)
         
         self.wm_opt.zero_grad()
         wm_loss.backward()
@@ -186,6 +228,8 @@ class DreamerV3AgentV2:
             'jepa_loss': jepa_loss.item(),
             'wm_loss': wm_loss.item(),
             'reward_loss': reward_loss.item(),
+            'posterior_loss': posterior_loss.item(),
+            'prior_loss': prior_loss.item(),
             'kl_loss': kl_loss.item(),
         }
     
@@ -221,7 +265,7 @@ class DreamerV3AgentV2:
                 # Boost entropy coefficient when too low
                 self.actor_critic.entropy_coeff = min(0.3, self.base_entropy_coeff * 4.0)
             else:
-                self.actor_critic.entropy_coeff = max(0.05, self.base_entropy_coeff)
+                self.actor_critic.entropy_coeff = max(0.005, self.base_entropy_coeff)
         
         ac_loss, ac_metrics = self.actor_critic.compute_loss(
             stoch=stoch_traj, deter=deter_traj,
@@ -278,7 +322,7 @@ class DreamerV3AgentV2:
                 action = probs.argmax(dim=-1).item()
             else:
                 # Temperature sampling
-                tempered_logits = torch.log(probs + 1e-8) / max(temperature, 1.0)  # FIX: floor temp at 0.7
+                tempered_logits = torch.log(probs + 1e-8) / max(temperature, 0.5)
                 tempered_probs = torch.softmax(tempered_logits, dim=-1)
                 dist = torch.distributions.Categorical(probs=tempered_probs)
                 action = dist.sample().item()
@@ -307,16 +351,52 @@ class DreamerV3AgentV2:
 class ReplayBuffer:
     def __init__(self, capacity=200000):
         self.buffer = deque(maxlen=capacity)
+        self.hold_idxs = deque(maxlen=capacity)
+        self.trade_idxs = deque(maxlen=capacity)
+        self._counter = 0
     
     def add(self, obs, action_oh, reward, next_obs, done, action_mask=None):
         self.buffer.append({
             'obs': obs, 'action': action_oh, 'reward': reward,
             'next_obs': next_obs, 'done': done, 'action_mask': action_mask,
         })
+        idx = self._counter
+        self._counter += 1
+        if action_oh[HOLD] > 0.5:
+            self.hold_idxs.append(idx)
+        else:
+            self.trade_idxs.append(idx)
+        # Trim oldest entries when buffer wraps around
+        if len(self.buffer) < self._counter:
+            oldest = self._counter - len(self.buffer)
+            if self.hold_idxs and self.hold_idxs[0] <= oldest:
+                self.hold_idxs.popleft()
+            if self.trade_idxs and self.trade_idxs[0] <= oldest:
+                self.trade_idxs.popleft()
     
     def sample(self, batch_size=128):
-        batch = np.random.choice(len(self.buffer), min(batch_size, len(self.buffer)), replace=False)
-        items = [self.buffer[i] for i in batch]
+        # V4.2: stratified O(1) — 50% HOLD, 50% trades
+        n = min(batch_size, len(self.buffer))
+        hold_list = list(self.hold_idxs)
+        trade_list = list(self.trade_idxs)
+        
+        n_hold = min(n // 2, len(hold_list))
+        n_trade = min(n - n_hold, len(trade_list))
+        n_hold = min(n - n_trade, n_hold)
+        
+        hold_batch = np.random.choice(hold_list, n_hold, replace=False).tolist() if n_hold > 0 else []
+        trade_batch = np.random.choice(trade_list, n_trade, replace=False).tolist() if n_trade > 0 else []
+        
+        remaining = n - n_hold - n_trade
+        fill = []
+        if remaining > 0:
+            used = set(hold_batch) | set(trade_batch)
+            pool = [i for i in range(len(self.buffer)) if i not in used]
+            if pool:
+                fill = np.random.choice(pool, min(remaining, len(pool)), replace=False).tolist()
+        
+        indices = hold_batch + trade_batch + fill
+        items = [self.buffer[i] for i in indices]
         return {
             'obs': np.array([x['obs'] for x in items]),
             'actions': np.array([x['action'] for x in items]),
