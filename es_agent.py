@@ -92,8 +92,10 @@ class ESAgent:
             offset += n
     
     def evaluate_single(self, policy, env, steps=1000) -> float:
-        """Évalue une politique, retourne le PnL final (pas le reward total)."""
+        """Évalue une politique, retourne le REWARD TOTAL (pas le PnL pur).
+        Le reward dense inclut time-decay, opening bonus, holding bonus."""
         obs = env.reset()
+        total_reward = 0.0
         lstm_hidden = None
         
         for _ in range(steps):
@@ -110,13 +112,12 @@ class ESAgent:
                 else:
                     action = probs.argmax(dim=-1).item()
             
-            obs, _, done, _ = env.step(action)
+            obs, reward, done, _ = env.step(action)
+            total_reward += reward
             if done:
                 break
         
-        # Fitness = PnL pur, pas le reward total
-        pnl_pct = (env.balance - FTMO_CONFIG['account_size']) / FTMO_CONFIG['account_size'] * 100
-        return float(pnl_pct)
+        return float(total_reward)
     
     def evaluate_population(self, envs: List, steps=500) -> List[float]:
         """Évalue toute la population sur des environnements parallèles."""

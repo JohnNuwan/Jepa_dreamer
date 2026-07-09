@@ -66,7 +66,7 @@ FTMO_CONFIG = {
     "profit_target": 0.10,
     "max_trades_per_day": 8,
     "max_concurrent_positions": 3,
-    "max_hold_bars": 96,           # 24h max hold
+    "max_hold_bars": 48,           # V5: 12h max hold (was 96/24h)
     "min_hold_bars": 4,            # 1h min hold
     "cooldown_after_losses": 3,
     "cooldown_bars": 8,

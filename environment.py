@@ -387,6 +387,9 @@ class MultiSymbolEnvV4:
                 positions_to_close.append((i, exit_reason))
             elif pos.bars_held >= FTMO_CONFIG['max_hold_bars']:
                 positions_to_close.append((i, 'TIMEOUT'))
+            # V5 ES: auto-close positions in profit after 20 bars
+            elif pos.unrealized_pnl(current_price) > 0 and pos.bars_held >= 20:
+                positions_to_close.append((i, 'AUTO_PROFIT'))
 
         for i, reason in reversed(positions_to_close):
             reward += self._close_position(i, current_price, reason)
