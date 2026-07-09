@@ -89,17 +89,20 @@ class ESTrainer:
             
             # Validation avec la meilleure politique (toutes les 5 gens pour plus de feedback)
             val_pnl, val_trades, val_wr = 0, 0, 0
+            did_validate = False
             if gen % 5 == 0:
                 val_pnl, val_trades, val_wr = self._validate()
+                did_validate = True
             
             # Log
             t = time.time() - t0
+            val_str = f"{val_pnl:+.2f}% tr={val_trades} wr={val_wr:.0f}%" if did_validate else "—"
             log = (f"Gen {gen:>4d} | {t:.1f}s | "
                    f"best={evo_metrics['best_fitness']:+.2f} "
                    f"mean={evo_metrics['mean_fitness']:+.2f} "
                    f"elite={evo_metrics['elite_mean']:+.2f} "
                    f"t±={trades_plus}/{trades_minus} "
-                   f"| val={val_pnl:+.2f}% tr={val_trades} wr={val_wr:.0f}%")
+                   f"| val={val_str}")
             print(log)
             log_file.write(log + '\n')
             log_file.flush()
@@ -107,8 +110,8 @@ class ESTrainer:
             self.metrics.append({
                 'generation': gen,
                 **{k: round(v, 4) if isinstance(v, float) else v for k, v in evo_metrics.items()},
-                'val_pnl': round(val_pnl, 2),
-                'val_trades': val_trades,
+                'val_pnl': round(val_pnl, 2) if did_validate else None,
+                'val_trades': val_trades if did_validate else None,
                 'trades_plus': trades_plus,
                 'trades_minus': trades_minus,
             })
@@ -117,7 +120,7 @@ class ESTrainer:
                 with open(self.metrics_path, 'w') as f:
                     json.dump(self.metrics, f, indent=2)
             
-            if val_pnl > self.best_val_pnl:
+            if did_validate and val_pnl > self.best_val_pnl:
                 self.best_val_pnl = val_pnl
                 self.best_val_gen = gen
                 self.agent.save(os.path.join(self.save_dir, 'best.pt'))
