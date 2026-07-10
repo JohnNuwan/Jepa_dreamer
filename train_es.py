@@ -1,8 +1,8 @@
 """
-train_es.py — Evolution Strategies V5 : antithetic sampling corrigé.
-BUGFIX V5: les paires +ε/-ε voient désormais le MÊME marché (même symbole, même step).
-Avant, -ε utilisait un reset() aléatoire → marchés différents → gradient = bruit.
-pop_size doublé (16→32) pour un gradient plus robuste.
+train_es.py — Evolution Strategies V5.1 : BUY/SELL dégelés + anti-crash.
+- BUY et SELL sont dégelés : le LSTM peut maintenant apprendre la direction.
+- Seul HOLD reste gelé (bias fixe anti-collapse).
+- Ajout try/except + NaN guard + empty_cache pour robustesse.
 """
 import sys, os, time, json
 import numpy as np
@@ -78,9 +78,17 @@ class ESTrainer:
             # Créer environnements
             envs = self._create_envs(gen)
             
-            # Évaluer la population (retourne effective_fitness, fitness_plus, fitness_minus)
-            effective_fitness, fitness_plus, fitness_minus = \
-                self.agent.evaluate_population(envs, steps=self.eval_steps)
+            try:
+                # Évaluer la population (retourne effective_fitness, fitness_plus, fitness_minus)
+                effective_fitness, fitness_plus, fitness_minus = \
+                    self.agent.evaluate_population(envs, steps=self.eval_steps)
+            except Exception as e:
+                print(f"   ❌ CRASH gen {gen} dans evaluate_population: {e}")
+                import traceback
+                traceback.print_exc()
+                # Sauvegarder l'état actuel avant de quitter
+                self.agent.save(os.path.join(self.save_dir, f'crash_gen{gen}.pt'))
+                break
             
             # Stats debug
             trades_plus = sum(1 for f in fitness_plus if f > -50)
@@ -127,6 +135,10 @@ class ESTrainer:
                 self.best_val_gen = gen
                 self.agent.save(os.path.join(self.save_dir, 'best.pt'))
                 print(f"   🏆 NEW BEST: {val_pnl:+.2f}% (gen {gen}, {val_trades} trades)")
+            
+            # V5.1: Nettoyer mémoire GPU après chaque génération
+            import torch
+            torch.cuda.empty_cache()
         
         self.agent.save(os.path.join(self.save_dir, 'final.pt'))
         with open(self.metrics_path, 'w') as f:

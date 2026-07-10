@@ -1,6 +1,8 @@
 """
-es_agent.py — Evolution Strategies pour trading FTMO.
-V5: antithetic corrigé (+ε/-ε sur MÊME marché), bias renforcé, pop_size doublé.
+es_agent.py — Evolution Strategies V5.1 pour trading FTMO.
+- BUY/SELL dégelés : le LSTM apprend la direction (seul HOLD reste gelé).
+- Antithetic corrigé (+ε/-ε sur MÊME marché).
+- NaN guard, try/except, empty_cache.
 """
 import torch
 import torch.nn as nn
@@ -37,14 +39,12 @@ class ESPolicy(nn.Module):
         # PYRAMID(6), PARTIAL_CLOSE(7) = 0
         self.register_buffer('action_bias', action_bias)
 
-        # V5: Masque pour geler les canaux HOLD/BUY/SELL du head[-1]
-        # Ces 3 canaux sont déterminés UNIQUEMENT par le bias fixe.
-        # Les poids du head[-1] correspondants sont exclus de l'évolution ES
-        # pour empêcher la dérive qui contrerait le bias.
+        # V5.1: Masque de gel — seul HOLD est gelé (le réseau doit apprendre BUY vs SELL).
+        # HOLD reste purement bias-driven pour éviter le collapse "zéro trade".
+        # BUY et SELL sont dégelés : le LSTM peut moduler le bias en fonction des features.
         self.register_buffer('frozen_action_mask', torch.ones(action_dim))
-        self.frozen_action_mask[0] = 0.0  # HOLD  → gelé (bias seul)
-        self.frozen_action_mask[1] = 0.0  # BUY   → gelé (bias seul)
-        self.frozen_action_mask[2] = 0.0  # SELL  → gelé (bias seul)
+        self.frozen_action_mask[0] = 0.0  # HOLD  → gelé (bias seul, anti-collapse)
+        # BUY(1) et SELL(2) SONT DÉGELÉS → le réseau apprend la direction
     
     def forward(self, x, hidden=None):
         out, h = self.lstm(x, hidden)
@@ -80,7 +80,7 @@ class ESAgent:
         n_params = self.master.count_params()
         print(f"ES Agent V5: {n_params:,} params | pop={pop_size} | σ={sigma} | lr={lr}")
         print(f"   GPUs: {len(self.devices)}× | Antithetic: ON (même marché) | Stochastique temp={temp_start}→{temp_end} sur {temp_decay_gens} gens")
-        print(f"   Bias HOLD/SELL/BUY gelé via frozen_action_mask")
+        print(f"   HOLD gelé (bias fixe) | BUY/SELL libres (LSTM apprend la direction)")
         
         self.population = []
         self._create_population()
@@ -269,7 +269,10 @@ class ESAgent:
         results_plus: list = [None] * self.pop_size
         results_minus: list = [None] * self.pop_size
         
-        max_workers = len(self.devices) * 3
+        # V5.1: Réduire max_workers à len(devices)*2 pour éviter la surcharge mémoire GPU
+        # Avec pop=16, on a 32 tâches (16 + 16 antithetic). Chaque worker charge
+        # un modèle sur GPU. Trop de workers = OOM.
+        max_workers = len(self.devices) * 2
         temperature = self.get_temperature()
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -281,7 +284,11 @@ class ESAgent:
             
             for future in as_completed(futures):
                 anti, idx = futures[future]
-                fitness, num_trades = future.result()
+                try:
+                    fitness, num_trades = future.result()
+                except Exception as e:
+                    print(f"   ⚠️  Erreur évaluation (anti={anti}, idx={idx}): {e}")
+                    fitness = -100.0  # fitness minimale en cas d'erreur
                 if anti:
                     results_minus[idx] = fitness
                 else:
@@ -289,6 +296,11 @@ class ESAgent:
         
         fitness_plus = [f for f in results_plus]
         fitness_minus = [f for f in results_minus]
+        
+        # V5.1: Libérer la mémoire GPU après évaluation de la population
+        for device in self.devices:
+            with torch.cuda.device(device):
+                torch.cuda.empty_cache()
         
         effective_fitness = [p - m for p, m in zip(fitness_plus, fitness_minus)]
         
@@ -333,13 +345,19 @@ class ESAgent:
         grad = grad / max(1, n_elite)
         
         master_vec += self.lr * grad
+        
+        # V5.1: Détection NaN — si le gradient explose, on rollback
+        if torch.isnan(master_vec).any() or torch.isinf(master_vec).any():
+            print(f"   ⚠️  NaN/Inf détecté dans master_vec après evolve! Rollback.")
+            master_vec = self._get_params_flat(self.master)  # restaurer
+            self._set_params_flat(self.master, master_vec)
+        
         self._set_params_flat(self.master, master_vec)
 
-        # V5: Remettre à zéro les poids du head[-1] pour les canaux gelés (HOLD, BUY, SELL)
-        # Ces poids dérivent inutilement car leur contribution est masquée dans forward().
-        # On les maintient à zéro pour éviter le gaspillage de capacité.
+        # V5.1: Remettre à zéro uniquement les poids HOLD (canal 0) qui est gelé
+        # BUY/SELL (canaux 1,2) sont libres d'apprendre
         with torch.no_grad():
-            self.master.head[-1].weight.data[self.master.frozen_action_mask == 0] = 0.0
+            self.master.head[-1].weight.data[0] = 0.0  # HOLD uniquement
 
         self._create_population()
         self.generation += 1
