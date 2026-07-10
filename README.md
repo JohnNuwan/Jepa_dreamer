@@ -1,50 +1,114 @@
-# FTMO Agent — DreamerV3 for Prop Firm Challenges
+# FTMO Agent — Evolution Strategies pour Challenges Prop Firm
 
-**RL agent entraîné à passer les challenges FTMO** en tradant XAUUSD, EURUSD, indices US/EU et BTCUSD sur M15, avec un DreamerV3 (world model + actor-critic + JEPA) sur 2 GPUs.
+**Agent de trading entraîné par Evolution Strategies (ES) à passer les challenges FTMO** sur XAUUSD, EURUSD, indices US/EU et BTCUSD en M15, avec LSTM + curriculum learning + antithetic sampling sur 2 GPUs.
 
 ## Architecture
 
 ```
 ftmo_agent/
-├── train.py              ← Point d'entrée : entraînement V4 avec curriculum
-├── diag.py               ← Diagnostic : charger un modèle et analyser les actions
-├── config.py             ← Configuration : symboles, spreads, FTMO rules, curriculum
-├── environment.py        ← Environnement V4 : spread variable, slippage, commission, pure PnL
-├── features_v2.py        ← Features V4 : 69/TF multi-timeframes (M15/H1/H4/D1)
-├── dreamer_trainer_v2.py ← DreamerV3 : 15.5M params sur 2 GPUs (JEPA + RSSM + ActorCritic)
-├── octopus/              ← Core ML : world model, JEPA self-supervised, actor-critic
+├── train_es.py           ← Point d'entrée : entraînement ES avec curriculum
+├── es_agent.py           ← Agent ES : LSTM 2×128, antithetic, dual GPU
+├── config.py             ← Configuration : symboles, spreads, règles FTMO, curriculum
+├── environment.py        ← Environnement V4 : spread variable, slippage, commission, PnL pur
+├── features_v2.py        ← Features multi-timeframes (M15/H1/H4/D1)
+├── test_synthetic.py     ← Tests synthétiques de l'agent
+├── checkpoints_es/       ← Modèles ES sauvegardés
 ├── data/                 ← Données OHLC M15 par symbole
-├── legacy/               ← Anciennes versions (V1-V3) archivées
-└── checkpoints_v4/       ← Modèles sauvegardés
+└── legacy/               ← Versions archivées (DreamerV3, PPO, V1-V3)
 ```
 
-## Changements V4
+## Evolution Strategies (ES)
 
-| Aspect | V3 (avant) | V4 (maintenant) |
-|--------|-----------|-----------------|
-| **Reward** | Shaping (pénalités, bonus) | **Pure PnL** (% du compte) |
-| **Spread** | Fixe | Variable (session × volatilité × aléa) |
-| **Slippage** | Aucun | Gaussien (~30% du spread) |
-| **Commission** | Aucune | $7/lot MT5 standard |
-| **Curriculum** | Non | 3 phases : 0% → 30% → 100% frictions |
-| **Features** | 33/TF | **69/TF** : HV, slopes, lag, corrélations |
-| **TP/SL** | 1.5/3.0 ATR | 2.0/4.0 ATR |
-| **Risque** | 1%/trade | 0.5%/trade |
+L'agent utilise une **Evolution Strategies** avec les caractéristiques suivantes :
+
+### Politique LSTM 2×128
+
+- **Réseau** : LSTM à 2 couches cachées de 128 neurones chacune
+- **Entrée** : ~296 features multi-timeframes (M15, H1, H4, D1) × 48 barres de lookback
+- **Sortie** : 8 logits d'action (HOLD, BUY, SELL, CLOSE, SPLIT_BUY, SPLIT_SELL, PYRAMID, PARTIAL_CLOSE)
+- **~500K paramètres** apprenables
+
+### Bias anti-HOLD
+
+Un buffer fixe **non-apprenable** (exclu des paramètres ES) est ajouté aux logits pour contrer la tendance naturelle à ne jamais trader :
+
+| Action | Bias |
+|--------|------|
+| HOLD | -2.0 |
+| BUY | +1.0 |
+| SELL | +1.0 |
+| SPLIT_BUY | +0.5 |
+| SPLIT_SELL | +0.5 |
+| CLOSE, PYRAMID, PARTIAL_CLOSE | 0.0 |
+
+### Antithetic sampling
+
+Pour chaque individu de la population, on évalue **deux politiques opposées** :
+- `master + noise` (fitness_plus)
+- `master - noise` (fitness_minus)
+
+La **fitness effective** = `fitness_plus - fitness_minus` donne un gradient **2× plus précis** et réduit la variance.
+
+### Dual GPU
+
+L'évaluation de la population est parallélisée sur **2 GPUs** (`cuda:0` et `cuda:1`) via `ThreadPoolExecutor`. Chaque politique est assignée à un GPU en round-robin, et les évaluations antithetic sont dispatchées sur les deux GPUs simultanément.
+
+### Fitness = PnL pur
+
+La fitness est basée uniquement sur le **PnL réalisé** :
+
+```
+fitness = (balance_final - balance_initial) / balance_initial × 100
+```
+
+- **Pénalité zéro-trade** : -50 si aucun trade n'est pris pendant l'évaluation
+- **Bonus trading** : +2 si au moins un trade est effectué
+- Aucun reward shaping dense — l'agent est jugé sur son résultat final
+
+### Température stochastique décroissante
+
+L'exploration est contrôlée par une température qui décroît linéairement :
+- **Début** : `temp = 1.5` (forte exploration, sampling softmax)
+- **Fin** : `temp = 0.3` (exploitation, quasi-greedy)
+- **Décroissance** : sur 150 générations
+
+### Sélection par élite
+
+- **Top 25%** de la population conservé comme élite
+- Pondération par rang (ranking-based weights)
+- Gradient normalisé par le nombre d'élites et la fitness signée
+
+## Curriculum 3 phases
+
+L'environnement augmente progressivement la difficulté :
+
+| Phase | Épisodes | Spread | Slippage | Commission | Trades max |
+|-------|----------|--------|----------|------------|------------|
+| **Phase 1** | 0–200 | 0% | 0% | 0% | 20 |
+| **Phase 2** | 200–500 | 30% | 30% | 0% | 12 |
+| **Phase 3** | 500+ | 100% | 100% | 100% | 8 |
 
 ## Utilisation
 
 ```bash
 # Entraînement
 cd ftmo_agent
-python3 train.py --episodes 3000
+python3 train_es.py
 
-# Diagnostic
-python3 diag.py
+# Tests synthétiques
+python3 test_synthetic.py
 ```
 
-## Résultats attendus
+## Configuration
 
-Le curriculum V4 permet à l'agent d'apprendre progressivement :
-1. **Phase 1** (0-200ep) : spread nul, pas de slippage → apprendre à trader
-2. **Phase 2** (200-500ep) : spread 30%, slippage réduit → affiner la sélection
-3. **Phase 3** (500+ ep) : spread réel, slippage, commission → environnement réaliste FTMO
+Les paramètres principaux sont dans `config.py` :
+
+- **7 symboles actifs** : XAUUSD, EURUSD, GBPUSD, US30, GER40, US500, US100, BTCUSD
+- **8 actions** : HOLD, BUY, SELL, CLOSE, SPLIT_BUY, SPLIT_SELL, PYRAMID, PARTIAL_CLOSE
+- **Règles FTMO** : DD quotidien 5%, DD total 10%, profit target 10%, max 8 trades/jour
+- **Risk** : 0.5% par trade, SL à 2 ATR, TP à 4 ATR
+- **ES** : population 16, σ=0.02, lr=0.1, 25% élite
+
+## Résultats
+
+L'approche ES avec antithetic sampling et curriculum learning permet à l'agent d'apprendre sans backpropagation, en optimisant directement le PnL réalisé via des perturbations aléatoires de la politique.
