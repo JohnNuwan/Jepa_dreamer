@@ -34,7 +34,7 @@ def load_all_symbols(data_dir='data'):
 
 
 class ESTrainer:
-    def __init__(self, n_generations=500, pop_size=32, eval_steps=2000,
+    def __init__(self, n_generations=200, pop_size=16, eval_steps=1000,
                  hidden_dim=128, sigma=0.015, lr=0.1, save_dir='checkpoints_es'):
         self.n_generations = n_generations
         self.pop_size = pop_size
@@ -226,6 +226,6 @@ class ESTrainer:
 
 
 if __name__ == "__main__":
-    trainer = ESTrainer(n_generations=300, pop_size=32, eval_steps=2000,
+    trainer = ESTrainer(n_generations=200, pop_size=16, eval_steps=1000,
                         hidden_dim=128, sigma=0.02, lr=0.1)
     trainer.run()

@@ -62,7 +62,7 @@ class ESAgent:
     """Evolution Strategies V5: antithetic corrigé, bias gelé, gradient propre."""
     
     def __init__(self, input_dim=296, hidden_dim=128, action_dim=8,
-                 pop_size=32, sigma=0.015, lr=0.1, elite_frac=0.25, 
+                 pop_size=16, sigma=0.015, lr=0.1, elite_frac=0.25, 
                  devices=('cuda:0', 'cuda:1'), temp_start=1.5, temp_end=0.3, temp_decay_gens=150):
         self.devices = [torch.device(d) for d in devices]
         self.primary_device = self.devices[0]
@@ -334,15 +334,23 @@ class ESAgent:
         
         master_vec += self.lr * grad
         self._set_params_flat(self.master, master_vec)
-        
+
+        # V5: Remettre à zéro les poids du head[-1] pour les canaux gelés (HOLD, BUY, SELL)
+        # Ces poids dérivent inutilement car leur contribution est masquée dans forward().
+        # On les maintient à zéro pour éviter le gaspillage de capacité.
+        with torch.no_grad():
+            self.master.head[-1].weight.data[self.master.frozen_action_mask == 0] = 0.0
+
         self._create_population()
         self.generation += 1
         
         elite_fitness = [f for f, _ in [x[1] for x in elite]]
+        grad_norm = grad.norm().item()  # V5: norme du gradient pour diagnostic
         return {
             'best_fitness': elite_fitness[0] if elite_fitness else 0,
             'mean_fitness': np.mean(fitness),
             'elite_mean': np.mean(elite_fitness) if elite_fitness else 0,
+            'grad_norm': round(grad_norm, 6),
         }
     
     def get_best_policy(self):
