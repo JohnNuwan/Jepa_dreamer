@@ -344,15 +344,15 @@ class ESAgent:
         # Normaliser le gradient par le nombre d'élites
         grad = grad / max(1, n_elite)
         
+        old_master_vec = master_vec.clone()  # V5.1: sauvegarde pour rollback
         master_vec += self.lr * grad
         
-        # V5.1: Détection NaN — si le gradient explose, on rollback
+        # V5.1: Détection NaN — si le gradient explose, on skip l'update
         if torch.isnan(master_vec).any() or torch.isinf(master_vec).any():
-            print(f"   ⚠️  NaN/Inf détecté dans master_vec après evolve! Rollback.")
-            master_vec = self._get_params_flat(self.master)  # restaurer
+            print(f"   ⚠️  NaN/Inf détecté après evolve! Update annulée.")
+            master_vec = old_master_vec  # restaurer l'original
+        else:
             self._set_params_flat(self.master, master_vec)
-        
-        self._set_params_flat(self.master, master_vec)
 
         # V5.1: Remettre à zéro uniquement les poids HOLD (canal 0) qui est gelé
         # BUY/SELL (canaux 1,2) sont libres d'apprendre
