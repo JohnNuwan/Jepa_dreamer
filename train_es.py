@@ -1,6 +1,8 @@
 """
-train_es.py — Evolution Strategies V2 : antithetic sampling, pénalité zéro-trade.
-Population évaluée avec antithetic variates pour un gradient 2× plus précis.
+train_es.py — Evolution Strategies V5 : antithetic sampling corrigé.
+BUGFIX V5: les paires +ε/-ε voient désormais le MÊME marché (même symbole, même step).
+Avant, -ε utilisait un reset() aléatoire → marchés différents → gradient = bruit.
+pop_size doublé (16→32) pour un gradient plus robuste.
 """
 import sys, os, time, json
 import numpy as np
@@ -10,7 +12,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import (SYMBOLS, ACTIVE_SYMBOLS, FTMO_CONFIG, N_ACTIONS, ACTION_NAMES,
-                     HOLD, CURRICULUM_CONFIG)
+                     HOLD, BUY, CURRICULUM_CONFIG)
 from features_v2 import compute_multi_tf_features, compute_correlations
 from environment import MultiSymbolEnvV4
 from es_agent import ESAgent
@@ -32,8 +34,8 @@ def load_all_symbols(data_dir='data'):
 
 
 class ESTrainer:
-    def __init__(self, n_generations=500, pop_size=16, eval_steps=2000,
-                 hidden_dim=128, sigma=0.015, lr=0.01, save_dir='checkpoints_es'):
+    def __init__(self, n_generations=500, pop_size=32, eval_steps=2000,
+                 hidden_dim=128, sigma=0.015, lr=0.1, save_dir='checkpoints_es'):
         self.n_generations = n_generations
         self.pop_size = pop_size
         self.eval_steps = eval_steps
@@ -65,9 +67,9 @@ class ESTrainer:
     
     def run(self):
         log_file = open(self.log_path, 'w')
-        print(f"\n=== ES Training V4 ({self.n_generations} gens, pop={self.pop_size}) ===")
+        print(f"\n=== ES Training V5 ({self.n_generations} gens, pop={self.pop_size}) ===")
         print(f"   {self.eval_steps} steps/eval, σ={self.agent.sigma}, lr={self.agent.lr}")
-        print(f"   Stochastique temp={self.agent.temp_start}→{self.agent.temp_end} | Dual GPU")
+        print(f"   Antithetic corrigé (même marché) | Stochastique temp={self.agent.temp_start}→{self.agent.temp_end} | Dual GPU")
         print()
         
         for gen in range(self.n_generations):
@@ -169,7 +171,8 @@ class ESTrainer:
         # Log détaillé première étape pour diagnostic
         actions_taken = {a: 0 for a in range(N_ACTIONS)}
         first_logits = None
-        
+        logit_history = []  # V5: collecte les logits sur tous les steps
+
         for step_i in range(500):
             if env.current_step >= len(env.df) - 1:
                 break
@@ -180,34 +183,49 @@ class ESTrainer:
                 mask_t = torch.BoolTensor(mask).unsqueeze(0).to(self.agent.primary_device)
                 logits_masked = logits.masked_fill(~mask_t, float('-inf'))
                 action = logits_masked.argmax(dim=-1).item()
-                
+
                 if first_logits is None:
                     first_logits = logits_masked.cpu().numpy().flatten()
+                # V5: échantillonner les logits toutes les 20 étapes pour diagnostic
+                if step_i % 20 == 0:
+                    logit_history.append(logits_masked.cpu().numpy().flatten().copy())
             obs, _, done, _ = env.step(action)
             actions_taken[action] += 1
             if done:
                 break
-        
+
         pnl = (env.balance - FTMO_CONFIG['account_size']) / FTMO_CONFIG['account_size'] * 100
         wr = env.winning_trades / max(1, env.total_trades) * 100
-        
-        # Log diagnostique
-        if env.total_trades == 0 and first_logits is not None:
-            # Afficher les logits masqués pour comprendre pourquoi HOLD gagne
+
+        # V5: Log diagnostique TOUJOURS (pas seulement quand 0 trades)
+        if first_logits is not None:
             top_actions = np.argsort(first_logits)[::-1][:4]
-            top_str = " | ".join(f"{ACTION_NAMES[a]}={first_logits[a]:+.2f}" 
+            top_str = " | ".join(f"{ACTION_NAMES[a]}={first_logits[a]:+.2f}"
                                  for a in top_actions if not np.isinf(first_logits[a]))
             val_mask = env.get_action_mask()
             mask_names = [ACTION_NAMES[i] for i, m in enumerate(val_mask) if m]
-            print(f"   🔍 VALIDATION DEBUG: 0 trades | symbol={symbol} | "
+
+            # V5: Analyser la dérive des logits BUY/HOLD
+            buy_logit = first_logits[BUY] if not np.isinf(first_logits[BUY]) else float('-inf')
+            hold_logit = first_logits[HOLD] if not np.isinf(first_logits[HOLD]) else float('-inf')
+            buy_hold_gap = buy_logit - hold_logit if not np.isinf(buy_logit) and not np.isinf(hold_logit) else 0
+
+            status = "🟢 MASTER TRADE" if env.total_trades > 0 else "🔴 MASTER MUET"
+            print(f"   {status} | gen={self.agent.generation} | {symbol} | "
                   f"step_start={env.lookback + len(env.df) - 3000} | "
-                  f"top_logits={top_str} | "
-                  f"mask={mask_names}")
+                  f"trades={env.total_trades} | buy_hold_gap={buy_hold_gap:+.2f} | "
+                  f"top=[{top_str}] | mask={mask_names}")
+
+            # V5: Alerte si BUY/HOLD gap < 1.0 (le bias est contré)
+            if env.total_trades == 0 and buy_hold_gap < 1.0:
+                print(f"   ⚠️  BIAS CONTRÉ: buy_hold_gap={buy_hold_gap:+.2f} < 1.0 → les poids contrent le bias!")
+            elif env.total_trades == 0:
+                print(f"   ⚠️  0 TRADES malgré buy_hold_gap={buy_hold_gap:+.2f} → vérifier le mask ou le step")
         
         return pnl, env.total_trades, wr
 
 
 if __name__ == "__main__":
-    trainer = ESTrainer(n_generations=200, pop_size=16, eval_steps=1000,
+    trainer = ESTrainer(n_generations=300, pop_size=32, eval_steps=2000,
                         hidden_dim=128, sigma=0.02, lr=0.1)
     trainer.run()

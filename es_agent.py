@@ -1,7 +1,6 @@
 """
 es_agent.py — Evolution Strategies pour trading FTMO.
-V4: fitness = PnL réalisé pur (balance finale), pas le reward dense.
-Dual GPU, antithetic sampling, pénalité zéro-trade.
+V5: antithetic corrigé (+ε/-ε sur MÊME marché), bias renforcé, pop_size doublé.
 """
 import torch
 import torch.nn as nn
@@ -27,29 +26,43 @@ class ESPolicy(nn.Module):
         )
         # Bias fixe anti-HOLD — buffer (non appris par l'ES)
         # HOLD=0, BUY=1, SELL=2, CLOSE=3, SPLIT_BUY=4, SPLIT_SELL=5, PYRAMID=6, PARTIAL_CLOSE=7
+        # V5: bias renforcé pour résister à la dérive aléatoire des poids
         action_bias = torch.zeros(action_dim)
-        action_bias[0] = -2.0    # HOLD
-        action_bias[1] = +1.0    # BUY
-        action_bias[2] = +1.0    # SELL
-        action_bias[4] = +0.5    # SPLIT_BUY
-        action_bias[5] = +0.5    # SPLIT_SELL
-        # CLOSE(3), PYRAMID(6), PARTIAL_CLOSE(7) = 0
+        action_bias[0] = -4.0    # HOLD  ← fortement pénalisé (diff de 7.0 vs BUY)
+        action_bias[1] = +3.0    # BUY   ← fortement favorisé
+        action_bias[2] = +3.0    # SELL  ← fortement favorisé
+        action_bias[4] = +1.5    # SPLIT_BUY
+        action_bias[5] = +1.5    # SPLIT_SELL
+        action_bias[3] = +0.5    # CLOSE (léger encouragement à fermer)
+        # PYRAMID(6), PARTIAL_CLOSE(7) = 0
         self.register_buffer('action_bias', action_bias)
+
+        # V5: Masque pour geler les canaux HOLD/BUY/SELL du head[-1]
+        # Ces 3 canaux sont déterminés UNIQUEMENT par le bias fixe.
+        # Les poids du head[-1] correspondants sont exclus de l'évolution ES
+        # pour empêcher la dérive qui contrerait le bias.
+        self.register_buffer('frozen_action_mask', torch.ones(action_dim))
+        self.frozen_action_mask[0] = 0.0  # HOLD  → gelé (bias seul)
+        self.frozen_action_mask[1] = 0.0  # BUY   → gelé (bias seul)
+        self.frozen_action_mask[2] = 0.0  # SELL  → gelé (bias seul)
     
     def forward(self, x, hidden=None):
         out, h = self.lstm(x, hidden)
         logits = self.head(out[:, -1, :])
-        return logits + self.action_bias, h
+        # V5: Appliquer le masque de gel sur les canaux d'action
+        # Les canaux HOLD/BUY/SELL (0,1,2) sont masqués → contribution du réseau = 0
+        # Seul le bias fixe détermine ces canaux
+        return logits * self.frozen_action_mask + self.action_bias, h
     
     def count_params(self):
         return sum(p.numel() for p in self.parameters())
 
 
 class ESAgent:
-    """Evolution Strategies V4: fitness = realized PnL, dual GPU."""
+    """Evolution Strategies V5: antithetic corrigé, bias gelé, gradient propre."""
     
     def __init__(self, input_dim=296, hidden_dim=128, action_dim=8,
-                 pop_size=16, sigma=0.015, lr=0.1, elite_frac=0.25, 
+                 pop_size=32, sigma=0.015, lr=0.1, elite_frac=0.25, 
                  devices=('cuda:0', 'cuda:1'), temp_start=1.5, temp_end=0.3, temp_decay_gens=150):
         self.devices = [torch.device(d) for d in devices]
         self.primary_device = self.devices[0]
@@ -65,8 +78,9 @@ class ESAgent:
         
         self.master = ESPolicy(input_dim, hidden_dim, action_dim).to(self.primary_device)
         n_params = self.master.count_params()
-        print(f"ES Agent V4: {n_params:,} params | pop={pop_size} | σ={sigma} | lr={lr}")
-        print(f"   GPUs: {len(self.devices)}× | Antithetic: ON | Stochastique temp={temp_start}→{temp_end} sur {temp_decay_gens} gens")
+        print(f"ES Agent V5: {n_params:,} params | pop={pop_size} | σ={sigma} | lr={lr}")
+        print(f"   GPUs: {len(self.devices)}× | Antithetic: ON (même marché) | Stochastique temp={temp_start}→{temp_end} sur {temp_decay_gens} gens")
+        print(f"   Bias HOLD/SELL/BUY gelé via frozen_action_mask")
         
         self.population = []
         self._create_population()
@@ -102,17 +116,53 @@ class ESAgent:
             p.data.copy_(flat[offset:offset + n].view_as(p))
             offset += n
     
-    def _evaluate_one(self, policy, env, steps, device_idx, temperature=1.0):
+    def _evaluate_one(self, policy, env, steps, device_idx, temperature=1.0,
+                      init_state=None):
         """Évalue une politique STOCHASTIQUE (sample softmax).
         
         fitness = PnL réalisé en % + bonus trading.
         Le sampling stochastique permet d'explorer même quand les logits sont plats.
+        
+        Si init_state est fourni, l'environnement est initialisé avec cet état
+        (même symbole, même step) au lieu de reset() aléatoire.
+        Cela permet à l'antithetic sampling de comparer +ε et -ε sur le MÊME marché.
         """
         INITIAL_BALANCE = FTMO_CONFIG['account_size']
         ZERO_TRADE_PENALTY = 50.0
         
         device = self.devices[device_idx]
-        obs = env.reset()
+        
+        if init_state is not None:
+            # BUGFIX: antithetic — utiliser le MÊME état initial que env_plus
+            env.current_symbol = init_state['symbol']
+            env.features = init_state['features']
+            env.feature_names = init_state['feature_names']
+            env.df = init_state['df']
+            env.spec = init_state['spec']
+            env.current_step = init_state['step']
+            # Init manuelle (même que reset() mais sans aléatoire)
+            env.balance = INITIAL_BALANCE
+            env.peak_balance = env.balance
+            env.daily_start_balance = env.balance
+            env.prev_equity = env.balance
+            env.positions = []
+            env.trades_today = 0
+            env.consecutive_losses = 0
+            env.cooldown_until = 0
+            env.last_trade_day = -1
+            env.total_trades = 0
+            env.winning_trades = 0
+            env.buy_trades = 0
+            env.sell_trades = 0
+            env.episode_pnl = 0
+            env.realized_pnl = 0
+            env.bars_since_last_trade = 0
+            env.max_dd_exceeded = False
+            env.peak_equity = env.balance
+            env.episode_reward = 0.0
+            obs = env._get_obs()
+        else:
+            obs = env.reset()
         num_trades = 0
         lstm_hidden = None
         
@@ -162,17 +212,37 @@ class ESAgent:
         return self.temp_start + (self.temp_end - self.temp_start) * progress
     
     def evaluate_population(self, envs: List, steps=500) -> tuple:
-        """Évalue toute la population avec antithetic sampling sur GPUs parallèles."""
+        """Évalue toute la population avec antithetic sampling sur GPUs parallèles.
+        
+        V5 FIX: les paires antithetiques (+ε, -ε) sont évaluées sur le MÊME
+        marché (même symbole, même step de départ). Avant, -ε utilisait un
+        reset() aléatoire → marché différent → antithetic inutile.
+        """
         master_vec = self._get_params_flat(self.master)
         
+        # Étape 0 : capturer l'état initial de chaque env AVANT évaluation
+        # pour que l'antithetic voie exactement le même marché.
+        env_states = []
+        for env_plus in envs:
+            # reset() a déjà été appelé dans __init__ → on capture l'état
+            env_states.append({
+                'symbol': env_plus.current_symbol,
+                'step': env_plus.current_step,
+                'features': env_plus.features,
+                'feature_names': env_plus.feature_names,
+                'df': env_plus.df,
+                'spec': env_plus.spec,
+            })
+        
         # Préparer toutes les tâches
-        all_tasks = []  # (policy, env, device_idx, anti, idx)
+        # Format: (policy, env, device_idx, anti, idx, init_state)
+        all_tasks = []
         
         for i, ((policy_plus, noise, device), env_plus) in enumerate(zip(self.population, envs)):
             device_idx = i % len(self.devices)
-            all_tasks.append((policy_plus, env_plus, device_idx, False, i))
+            all_tasks.append((policy_plus, env_plus, device_idx, False, i, None))
         
-        # Antithetic: master - noise
+        # Antithetic: master - noise, MÊME état initial que env_plus
         for i, ((_, noise, _), _) in enumerate(zip(self.population, envs)):
             device_idx = i % len(self.devices)
             anti_device = self.devices[device_idx]
@@ -188,12 +258,13 @@ class ESAgent:
             noise_on_anti = noise.to(anti_device)
             self._set_params_flat(anti_policy, master_on_anti - noise_on_anti)
             
+            # BUGFIX: créer un env frais mais lui injecter le MÊME état initial
             anti_env = MultiSymbolEnvV4(
                 envs[0].data_dict, lookback=envs[0].lookback,
                 curriculum_episode=envs[0].curriculum_episode
             )
             
-            all_tasks.append((anti_policy, anti_env, device_idx, True, i))
+            all_tasks.append((anti_policy, anti_env, device_idx, True, i, env_states[i]))
         
         results_plus: list = [None] * self.pop_size
         results_minus: list = [None] * self.pop_size
@@ -203,8 +274,9 @@ class ESAgent:
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
-            for policy, env, device_idx, anti, idx in all_tasks:
-                future = executor.submit(self._evaluate_one, policy, env, steps, device_idx, temperature)
+            for policy, env, device_idx, anti, idx, init_state in all_tasks:
+                future = executor.submit(self._evaluate_one, policy, env, steps,
+                                        device_idx, temperature, init_state)
                 futures[future] = (anti, idx)
             
             for future in as_completed(futures):
@@ -239,12 +311,23 @@ class ESAgent:
         
         master_vec = self._get_params_flat(self.master)
         grad = torch.zeros_like(master_vec)
-        
+
+        # Collecter les fitness effectives des élites pour normalisation
+        elite_fitness = []
+        for (idx, (fit, (_, noise, device))), w in zip(elite, weights):
+            elite_fitness.append(fit)
+        elite_fitness = np.array(elite_fitness)
+
+        # Normalisation par la magnitude max pour éviter que sign() amplifie le bruit
+        max_abs_fit = max(np.max(np.abs(elite_fitness)), 1.0)
+
         for (idx, (fit, (_, noise, device))), w in zip(elite, weights):
             noise_primary = noise.to(self.primary_device)
-            # Normaliser la fitness pour éviter les explosions de gradient
+            # V5: Utiliser la magnitude normalisée du fitness au lieu de sign()
+            # sign() donne un poids égal à toutes les perturbations, amplifiant le bruit
+            # La normalisation pondère les bons signaux plus fortement
             fit_clipped = np.clip(fit, -100, 100)
-            grad += w * noise_primary * np.sign(fit_clipped)
+            grad += w * noise_primary * (fit_clipped / max_abs_fit)
         
         # Normaliser le gradient par le nombre d'élites
         grad = grad / max(1, n_elite)
